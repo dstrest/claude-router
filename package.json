@@ -19,6 +19,11 @@
   "engines": {
     "node": ">=22"
   },
+  "peerDependencies": {
+    "@opentui/core": "^0.8.2",
+    "@opentui/solid": "^0.8.2",
+    "solid-js": "^1.9.18"
+  },
   "files": [
     ".claude-plugin/plugin.json",
     "hooks",
