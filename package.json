@@ -10,6 +10,12 @@
   },
   "homepage": "https://github.com/alexei-led/claude-router#readme",
   "type": "module",
+  "exports": {
+    ".": "./opencode/server.ts",
+    "./tui": "./opencode/tui.tsx",
+    "./rpc": "./opencode/rpc.ts",
+    "./*": "./*"
+  },
   "engines": {
     "node": ">=22"
   },
@@ -17,6 +23,9 @@
     ".claude-plugin/plugin.json",
     "hooks",
     "lib",
+    "opencode/*.mjs",
+    "opencode/*.ts",
+    "opencode/*.tsx",
     "scripts/migrate-config.mjs",
     "docs/*.md",
     "docs/*.svg",

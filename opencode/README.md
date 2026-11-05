@@ -16,7 +16,15 @@ Failure escalation, context-fit checks, cost gates, checkpoint detection, usage 
 
 ## Install
 
-OpenCode's `plugin add` accepts only npm and Git packages, and this adapter is not published. Install it from a local checkout instead, which makes it available in every project on this machine:
+Install it from Git:
+
+```sh
+opencode plugin add "github:dstrest/claude-router#feat/opencode-router"
+```
+
+`plugin add` installs the plugin without options, so add `options` to its entry in your global config, using `opencode/opencode.example.jsonc` as a guide. Without routes, every tier keeps the active model.
+
+To run it from a local checkout instead:
 
 ```sh
 git clone https://github.com/alexei-led/claude-router
