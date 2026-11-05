@@ -7,6 +7,10 @@
 
 The Mod changes only the model and effort in Claude Code's turn hook. Claude Code sends the request, streams the reply, runs tools, and reports usage. The router does not proxy model traffic or start a local server; an Ollama classifier calls an Ollama server that you run. Subagents get one model each when they start, chosen the same way: every agent whose definition names no model, says `model: inherit`, or sets `modelRouting: auto`. Their steps are never re-routed. See [Subagent routing](docs/configuration.md#subagent-routing).
 
+## OpenCode local preview
+
+An additive OpenCode V2 adapter lives in [`opencode/`](opencode/README.md). It supports any enabled OpenCode provider and model variant, tier pins, and a `/router` panel showing the classifier, tier, activity, active and next models, and recent decisions. The Claude Code plugin remains the default and is unchanged by this adapter.
+
 ## Providers
 
 Use the provider that already works with Claude Code. Select its router profile, not a new endpoint:
