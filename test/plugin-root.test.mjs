@@ -17,9 +17,10 @@ test('the plugin root has no lockfile, so Claude Code installs no packages with 
   }
 });
 
-test('the root package.json declares no dependencies of any kind', () => {
+test('the root package.json declares only the peer dependencies of the OpenCode TUI', () => {
   const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
-  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies']) {
     assert.equal(pkg[field], undefined, `${field} in package.json`);
   }
+  assert.deepEqual(Object.keys(pkg.peerDependencies).sort(), ['@opentui/core', '@opentui/solid', 'solid-js']);
 });
