@@ -30,8 +30,9 @@
   "scripts": {
     "setup": "npm ci --prefix tools --ignore-scripts",
     "test": "node --test --test-timeout=8000 test/*.test.mjs experiments/mod-router/scripts/*.test.mjs",
-    "check": "tools/node_modules/.bin/biome check lib scripts test hooks types .claude-plugin package.json biome.json tsconfig.json tools/package.json tools/package-lock.json experiments/mod-router",
+    "check": "tools/node_modules/.bin/biome check lib scripts test hooks types opencode .claude-plugin package.json biome.json tsconfig.json tools/package.json tools/package-lock.json experiments/mod-router",
     "typecheck": "tools/node_modules/.bin/tsc -p tsconfig.json",
+    "typecheck:opencode": "tools/node_modules/.bin/tsc -p opencode/tsconfig.json",
     "validate": "claude plugin validate .claude-plugin/plugin.json && claude plugin validate .claude-plugin/marketplace.json",
     "test:plugin": "bash scripts/plugin-test.sh",
     "test:providers": "node experiments/mod-router/scripts/provider-acceptance.mjs",

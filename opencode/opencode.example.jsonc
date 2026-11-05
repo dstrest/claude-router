@@ -1,0 +1,51 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openrouter/deepseek/deepseek-v4.1-flash-1017",
+  "agents": {
+    "plan": {
+      "model": "openrouter/anthropic/claude-opus-5.5#high",
+      "permissions": [{ "action": "websearch", "resource": "*", "effect": "deny" }]
+    },
+    "build": { "permissions": [{ "action": "websearch", "resource": "*", "effect": "deny" }] },
+    "general": { "permissions": [{ "action": "websearch", "resource": "*", "effect": "deny" }] },
+    "explore": { "permissions": [{ "action": "websearch", "resource": "*", "effect": "deny" }] },
+    "web": {
+      "mode": "subagent",
+      "description": "Searches the web and reads web pages. Use this agent for every web search.",
+      "model": "openrouter/moonshotai/kimi-k3",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" }
+      ]
+    }
+  },
+  "plugins": [
+    {
+      "package": "/path/to/claude-router/opencode",
+      "options": {
+        "classifier": "jev-openrouter",
+        "activityRouting": "on",
+        "fixedAgents": ["plan", "web"],
+        "routes": {
+          "micro": "openrouter/anthropic/claude-haiku-5.5#high",
+          "low": "openrouter/anthropic/claude-haiku-5.5#high",
+          "medium": "openrouter/deepseek/deepseek-v4.1-flash-1017",
+          "high": "openrouter/anthropic/claude-opus-5.5#medium"
+        },
+        "activities": {
+          "plan": {
+            "micro": "openrouter/anthropic/claude-opus-5.5#high",
+            "low": "openrouter/anthropic/claude-opus-5.5#high",
+            "medium": "openrouter/anthropic/claude-opus-5.5#high",
+            "high": "openrouter/anthropic/claude-opus-5.5#high"
+          },
+          "code": {
+            "micro": "openrouter/deepseek/deepseek-v4.1-flash-1017",
+            "low": "openrouter/deepseek/deepseek-v4.1-flash-1017"
+          }
+        }
+      }
+    }
+  ]
+}

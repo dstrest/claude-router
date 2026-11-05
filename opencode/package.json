@@ -1,0 +1,17 @@
+{
+  "name": "@alexeiled/opencode-router",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./server.ts",
+    "./tui": "./tui.tsx",
+    "./rpc": "./rpc.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.5",
+    "@opentui/core": "^0.8.2",
+    "@opentui/solid": "^0.8.2",
+    "solid-js": "^1.9.18"
+  }
+}

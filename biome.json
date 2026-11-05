@@ -12,7 +12,12 @@
       "tools/*.json",
       ".claude-plugin/*.json",
       "hooks/*.json",
-      "hooks/*.mjs"
+      "hooks/*.mjs",
+      "opencode/**/*.mjs",
+      "opencode/**/*.ts",
+      "opencode/**/*.tsx",
+      "opencode/*.json",
+      "opencode/*.jsonc"
     ]
   },
   "formatter": { "indentStyle": "space", "indentWidth": 2, "lineWidth": 120 },
