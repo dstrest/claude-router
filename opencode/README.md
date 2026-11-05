@@ -19,8 +19,10 @@ Failure escalation, context-fit checks, cost gates, checkpoint detection, usage 
 Install it from Git:
 
 ```sh
-opencode plugin add "github:dstrest/claude-router#feat/opencode-router"
+opencode plugin add "github:dstrest/claude-router#opencode-plugin"
 ```
+
+The `opencode-plugin` branch is this code plus the TUI packages as root peer dependencies. They stay off the main line because the Claude Code plugin root must declare no dependencies.
 
 `plugin add` installs the plugin without options, so add `options` to its entry in your global config, using `opencode/opencode.example.jsonc` as a guide. Without routes, every tier keeps the active model.
 
