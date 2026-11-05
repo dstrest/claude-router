@@ -1,3 +1,4 @@
+/** @jsxImportSource @opentui/solid */
 import { Plugin } from '@opencode/plugin/tui';
 import { createEffect, createSignal, For, Show } from 'solid-js';
 import { formatModelRef } from './config.mjs';
