@@ -46,6 +46,8 @@ Open a session in any directory and run `/router` to confirm it loaded; `opencod
 | Work | Model |
 | --- | --- |
 | Planning (`plan` agent, or the `plan` activity at any tier) | Claude Opus 5.5 `#high` |
+| Code and PR review (the `review` activity at any tier) | Claude Opus 5.5 `#high` |
+| Debugging (the `debug` activity at any tier) | Kimi K3.1 Pro |
 | `micro` and `low` tiers | Claude Haiku 5.5 `#high` |
 | `medium` tier, the `code` activity at `micro` and `low`, and new sessions | DeepSeek V4.1 Flash 1017 |
 | `high` tier | Claude Opus 5.5 `#medium` |

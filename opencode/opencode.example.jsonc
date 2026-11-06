@@ -43,6 +43,18 @@
           "code": {
             "micro": "openrouter/deepseek/deepseek-v4.1-flash-1017",
             "low": "openrouter/deepseek/deepseek-v4.1-flash-1017"
+          },
+          "review": {
+            "micro": "openrouter/anthropic/claude-opus-5.5#high",
+            "low": "openrouter/anthropic/claude-opus-5.5#high",
+            "medium": "openrouter/anthropic/claude-opus-5.5#high",
+            "high": "openrouter/anthropic/claude-opus-5.5#high"
+          },
+          "debug": {
+            "micro": "openrouter/moonshotai/kimi-k3.1-pro",
+            "low": "openrouter/moonshotai/kimi-k3.1-pro",
+            "medium": "openrouter/moonshotai/kimi-k3.1-pro",
+            "high": "openrouter/moonshotai/kimi-k3.1-pro"
           }
         }
       }
