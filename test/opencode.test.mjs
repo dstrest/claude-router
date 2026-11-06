@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { coldWriteUsd, inputBounds } from '../lib/cost.mjs';
+import { compareReply, observedReplyUsd } from '../lib/savings.mjs';
 import {
   availableModelIds,
   formatModelRef,
@@ -318,6 +320,7 @@ test('the usage report reads as routing against no routing', () => {
   assert.equal(lines[2], 'Cheaper models -$0.80 · stronger $0.00 · switches +$0.05');
   assert.ok(lines.includes('What if: openrouter/cheap/tiny $0.50'));
   assert.ok(lines.some((line) => /This session, the classifier agreed on 3 of 4 turns · p95 2.0s/.test(line)));
+
   assert.ok(lines.some((line) => /Switch cache writes took 20%/.test(line)));
 });
 
@@ -373,4 +376,91 @@ test('a comparison over fewer replies than the spend says so, and a slow p95 is 
   });
   assert.equal(lines[1], 'Routing vs no routing (estimate, 6 of 7 replies): $0.90 vs $1.00 · -$0.10 (-10%)');
   assert.ok(lines.some((line) => /p95 over 8\.0s/.test(line)));
+});
+
+const prices = (input, write, read = input / 10) => [{ input, output: input * 5, cache: { read, write } }];
+const entry = (ref, cost) => ({ ...ref, variants: [], limit: { context: 1_000_000 }, cost });
+const opusRef = parseModelRef('openrouter/anthropic/claude-opus-5.5');
+const modelIdOf = (ref) => `${ref.providerID}/${ref.id}`;
+const flashRef = parseModelRef('openrouter/deepseek/deepseek-v4.1-flash-1017');
+const pricedConfig = () =>
+  routerConfig(
+    normalizeOptions({ routes: { high: formatModelRef(opusRef), low: formatModelRef(flashRef) } }),
+    [entry(opusRef, prices(4, 5)), entry(flashRef, prices(0.3, 0, 0.006))],
+    flashRef,
+  );
+
+test('a model bills cache writes at the catalog price, or at input when it lists none', () => {
+  const cfg = pricedConfig();
+  assert.equal(cfg.models[formatModelRef(opusRef)].writeMultiplier, 1.25);
+  assert.equal(cfg.models[formatModelRef(flashRef)].writeMultiplier, 1);
+  const free = routerConfig(normalizeOptions({ routes: {} }), [entry(flashRef, prices(0, 0, 0))], flashRef);
+  assert.equal(free.models[formatModelRef(flashRef)].writeMultiplier, undefined);
+});
+
+test('a cold write prices at the model multiplier', () => {
+  const cfg = pricedConfig();
+  assert.equal(coldWriteUsd(cfg, formatModelRef(opusRef), 400_000, 0), 2);
+  assert.equal(coldWriteUsd(cfg, formatModelRef(flashRef), 400_000, 0), 0.12);
+});
+
+test('a model with no multiplier keeps the configured write price', () => {
+  const cfg = pricedConfig();
+  delete cfg.models[formatModelRef(opusRef)].writeMultiplier;
+  assert.equal(coldWriteUsd(cfg, formatModelRef(opusRef), 400_000, 0), 3.2);
+});
+
+test('the input bounds use the model multiplier for a cold prompt', () => {
+  const cfg = pricedConfig();
+  const route = cfg.routes.high;
+  const facts = { models: {}, effort: null };
+  assert.equal(inputBounds(cfg, route, 1_000_000, facts, 0).max, 5);
+});
+
+test('observed and compared replies each price writes on their own model', () => {
+  const cfg = pricedConfig();
+  const usage = {
+    model: modelIdOf(opusRef),
+    input_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 1_000_000,
+    output_tokens: 0,
+  };
+  assert.equal(observedReplyUsd(cfg, usage, '5m', 0), 5);
+  const { reply } = compareReply(cfg, null, {
+    usage,
+    served: { model: modelIdOf(opusRef), effort: null },
+    yours: { model: modelIdOf(flashRef), effort: null },
+    ttl: '5m',
+    now: 0,
+  });
+  assert.equal(reply.routedUsd, 5);
+  assert.equal(reply.yoursUsd, 0.3);
+});
+
+test('classifier readings name their scope and the largest miss', () => {
+  const base = {
+    period: 'today',
+    spendUsd: 1,
+    replies: 1,
+    comparedReplies: 1,
+    routedUsd: 1,
+    yoursUsd: 1,
+    differenceUsd: 0,
+    cheaperUsd: 0,
+    strongerUsd: 0,
+    switchUsd: 0,
+    share: 0,
+  };
+  const line = (fields) => usageLines({ ...base, ...fields }).find((text) => /classifier/.test(text));
+  assert.equal(
+    line({
+      agreement: { matched: 7, total: 10 },
+      statsScope: 'all',
+      disagreements: [{ predicted: 'ops', observed: 'code', n: 2 }],
+      latency: { ms: 500, over: false, turns: 10 },
+    }),
+    'All sessions, the classifier agreed on 7 of 10 turns · p95 0.5s · most missed: ops was code (2)',
+  );
+  assert.match(line({ agreement: { matched: 1, total: 1 }, statsScope: 'session' }), /^This session/);
 });

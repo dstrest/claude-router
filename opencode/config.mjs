@@ -122,7 +122,6 @@ export function normalizeOptions(options = {}) {
     classifiers,
     mode: options.mode ?? config.mode,
     policy: checkedPolicy(config.policy, options.policy),
-    // shortcut: one cache mode for every route; OpenRouter mixes explicit and automatic caches, so upgrade when a host setting names the mode per model.
     cache: { ...config.cache, effortScope: 'shared' },
     fixedAgents: options.fixedAgents ?? [],
     activityRouting: options.activityRouting ?? config.activityRouting,
@@ -159,6 +158,8 @@ function modelSpec(catalog, ref) {
     // shortcut: only the first context tier is priced; upgrade if a model bills several.
     longContext: long?.tier && input > 0 ? { above: long.tier.size, multiplier: long.input / input } : undefined,
     imageInput: entry.capabilities?.input?.includes('image'),
+    // A model with no listed write price has none: a cold prompt just pays input.
+    writeMultiplier: input > 0 ? (base.cache?.write > 0 ? base.cache.write / input : 1) : undefined,
     billing: input > 0 ? 'credits' : 'plan',
     efforts: [],
   };

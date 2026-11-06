@@ -55,9 +55,12 @@ export function usageLines(report) {
     lines.push(`What if: ${report.whatIf.map((row) => `${row.model} ${usd(row.usd)}`).join(' · ')}`);
   if (report.agreement?.total) {
     const { matched, total } = report.agreement;
-    const { latency } = report;
+    const { latency, statsScope, disagreements } = report;
     const wait = latency ? ` · p95 ${latency.over ? 'over ' : ''}${(latency.ms / 1000).toFixed(1)}s` : '';
-    lines.push(`This session, the classifier agreed on ${matched} of ${total} turns${wait}`);
+    const miss = disagreements?.[0];
+    const missed = miss ? ` · most missed: ${miss.predicted} was ${miss.observed} (${miss.n})` : '';
+    const scope = statsScope === 'all' ? 'All sessions' : 'This session';
+    lines.push(`${scope}, the classifier agreed on ${matched} of ${total} turns${wait}${missed}`);
   }
   for (const insight of report.insights ?? []) lines.push(INSIGHT_TEXT[insight.kind]?.(insight));
   return lines;
