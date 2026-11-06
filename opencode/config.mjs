@@ -36,6 +36,7 @@ export function modelOptions(models) {
 }
 
 function available(models, ref) {
+  if (!ref) return false;
   return models.some((model) => {
     if (model.providerID !== ref.providerID || model.id !== ref.id || model.enabled === false) return false;
     return !ref.variant || variantIDs(model).includes(ref.variant);
@@ -91,7 +92,7 @@ export function classifierConfig(config, currentModel) {
   const routes = Object.fromEntries(
     TIERS.map((tier) => {
       const ref = config.routeRefs[tier] ?? currentModel;
-      return [tier, { model: formatModelRef(ref), effort: ref.variant ?? null }];
+      return [tier, { model: formatModelRef(ref), effort: ref?.variant ?? null }];
     }),
   );
   return { ...config, routes };

@@ -1,6 +1,7 @@
 import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
 import { activeClassifier, TIERS } from '../lib/config.mjs';
+import { classifierStatus, classifierWarns } from '../lib/display.mjs';
 import { initialState as initialPolicy } from '../lib/policy.mjs';
 import {
   classifierConfig,
@@ -18,14 +19,17 @@ const clip = (text, limit) => {
   return value.length <= limit ? value : `${value.slice(0, limit / 2)}\n…\n${value.slice(-limit / 2)}`;
 };
 
+// Stored messages (`session.context()`) give a user turn as `text`; provider messages (`context.messages`) use parts.
 function messageText(message) {
-  if (!['user', 'assistant'].includes(message?.type ?? message?.role)) return null;
+  const role = message?.type ?? message?.role;
+  if (!['user', 'assistant'].includes(role)) return null;
+  if (typeof message.text === 'string') return { role, text: message.text };
   const content = Array.isArray(message.content) ? message.content : [];
   const text = content
     .filter((part) => part?.type === 'text' && typeof part.text === 'string')
     .map((part) => part.text)
     .join('\n');
-  return { role: message.type ?? message.role, text };
+  return { role, text };
 }
 
 function dialogue(messages, prompt, config) {
@@ -52,6 +56,17 @@ function sleep(ms, { signal }) {
   });
 }
 
+// The host turns a rejected session hook into a defect that loses the prompt, and a throw would end the event loop.
+const failOpen =
+  (handler) =>
+  async (...args) => {
+    try {
+      return await handler(...args);
+    } catch (error) {
+      console.error('OpenCode router failed open', error);
+    }
+  };
+
 const initialState = (session) => ({
   sessionID: session.id,
   parentID: session.parentID ?? null,
@@ -71,7 +86,7 @@ const initialState = (session) => ({
   reason: 'ready',
   error: null,
   pendingPin: null,
-  reviewing: false,
+  pinned: false,
   requests: 0,
   switchedAtRequest: 0,
   switches: 0,
@@ -85,7 +100,9 @@ const initialState = (session) => ({
 export async function createController(ctx, options = {}, dependencies = {}) {
   const config = normalizeOptions(options);
   const sessions = new Map();
-  const clients = new Map();
+  const reviews = new Map();
+  // Shared so one session's failures pause the classifier for all, and not exclusive so sessions do not answer each other `busy`.
+  const client = new ClassifierClient({ exclusive: false });
   const controller = new AbortController();
   let publish = async () => {};
 
@@ -131,16 +148,26 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     };
   }
 
-  async function ask(sessionID, prompt, messages) {
+  function cancelReview(sessionID) {
+    reviews.get(sessionID)?.abort();
+    reviews.delete(sessionID);
+  }
+
+  function classifierProblem(cfg, error) {
+    if (!classifierWarns(error)) return null;
+    const status = classifierStatus(cfg, error);
+    return error === 'paused' ? `${status} until ${new Date(client.pausedUntil).toLocaleTimeString()}` : status;
+  }
+
+  async function ask(sessionID, prompt, messages, abort = controller.signal) {
     const state = await ensure(sessionID);
     const cfg = classifierConfig(config, state.activeModel);
     const credentials = await resolveCredentials(activeClassifier(cfg), async (name) => {
       const env = name.toUpperCase();
       return ctx.options[name] || process.env[env] || (name === 'openrouter_api_key' ? openRouterKey() : null);
     });
-    const key = `${sessionID}:${config.classifier}`;
-    if (!clients.has(key)) clients.set(key, new ClassifierClient());
-    const signal = controller.signal;
+    const signal = AbortSignal.any([controller.signal, abort]);
+    const turns = dialogue(messages, prompt, config);
     const request = async (url, init) => {
       const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(activeClassifier(cfg).timeoutMs + 100)]);
       const response = await fetch(url, { ...init, signal: requestSignal });
@@ -151,18 +178,19 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         headers: Object.fromEntries(response.headers),
       };
     };
-    if (dependencies.ask)
-      return dependencies.ask({ config: cfg, prompt, turns: dialogue(messages, prompt, config), state });
-    return clients.get(key).ask({
-      request,
-      sleep,
-      config: cfg,
-      apiKey: credentials.apiKey,
-      endpoint: credentials.endpoint,
-      prompt: clip(prompt, config.context.maxTextChars),
-      turns: dialogue(messages, prompt, config),
-      signal,
-    });
+    const result = dependencies.ask
+      ? await dependencies.ask({ config: cfg, prompt, turns, state, signal })
+      : await client.ask({
+          request,
+          sleep,
+          config: cfg,
+          apiKey: credentials.apiKey,
+          endpoint: credentials.endpoint,
+          prompt: clip(prompt, config.context.maxTextChars),
+          turns,
+          signal,
+        });
+    return { advice: result.advice, error: classifierProblem(cfg, result.error) };
   }
 
   function record(state, origin, decision) {
@@ -197,7 +225,8 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         downAllowed: state.requests - state.switchedAtRequest >= config.policy.minDwellRequests,
       },
     });
-    Object.assign(state, decision, { phase: state.mode === 'manual' ? 'manual' : 'routed', pendingPin: null });
+    Object.assign(state, decision, { phase: state.mode === 'manual' ? 'manual' : 'routed' });
+    if (pin) state.pendingPin = null;
     record(state, origin, decision);
     if (!sameModel(state.activeModel, state.nextModel)) {
       try {
@@ -213,22 +242,18 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     await update(state);
   }
 
-  async function review(sessionID, messages, generation) {
-    const state = await ensure(sessionID);
+  async function review(state, messages) {
+    const abort = new AbortController();
+    reviews.set(state.sessionID, abort);
     try {
-      const result = await ask(sessionID, state.lastPrompt ?? '', messages);
-      if (state.generation !== generation || state.mode !== 'auto' || controller.signal.aborted) return;
+      const result = await ask(state.sessionID, state.lastPrompt ?? '', messages, abort.signal);
+      // A failed review is a no-op: the route, the reason and any pin stay as they were.
+      if (abort.signal.aborted || controller.signal.aborted || state.mode !== 'auto' || !result.advice) return;
       await applyDecision(state, 'review', result);
     } catch (error) {
-      if (state.generation === generation) {
-        state.error = error instanceof Error ? error.message : String(error);
-        state.reason = 'review failed; keeping active model';
-      }
+      console.error('OpenCode router review failed', error);
     } finally {
-      if (state.generation === generation) {
-        state.reviewing = false;
-        await update(state);
-      }
+      if (reviews.get(state.sessionID) === abort) reviews.delete(state.sessionID);
     }
   }
 
@@ -278,8 +303,9 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       await update(state);
       return sessionSnapshot(state);
     },
-    async prompt(event) {
+    prompt: failOpen(async (event) => {
       const state = await ensure(event.sessionID);
+      cancelReview(event.sessionID);
       state.generation += 1;
       const generation = state.generation;
       state.lastPrompt = event.prompt.text;
@@ -293,6 +319,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.reason = null;
       state.error = null;
       const pin = state.pendingPin;
+      state.pinned = Boolean(pin);
       if (!pin) {
         state.phase = 'choosing';
         await update(state);
@@ -310,8 +337,8 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         state.error = error instanceof Error ? error.message : String(error);
         await update(state);
       }
-    },
-    async context(event) {
+    }),
+    context: failOpen(async (event) => {
       const state = await ensure(event.sessionID);
       state.agent = event.agent;
       state.activeModel = event.model;
@@ -320,32 +347,26 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.requests += 1;
       await update(state);
       const every = config.policy.reviewEveryRequests;
-      const routed = state.mode === 'auto' && !config.fixedAgents.includes(event.agent);
-      if (routed && every > 0 && state.requests % every === 0 && !state.reviewing) {
-        state.reviewing = true;
-        const generation = state.generation;
-        void review(state.sessionID, event.messages, generation).catch(async (error) => {
-          state.reviewing = false;
-          state.error = error instanceof Error ? error.message : String(error);
-          await update(state);
-        });
-      }
-    },
-    async idle(sessionID) {
+      const routed =
+        state.mode === 'auto' && !state.pinned && !state.parentID && !config.fixedAgents.includes(event.agent);
+      if (routed && every > 0 && state.requests % every === 0 && !reviews.has(state.sessionID))
+        void review(state, event.messages);
+    }),
+    idle: failOpen(async (sessionID) => {
+      cancelReview(sessionID);
       const state = await ensure(sessionID);
       const messages = await ctx.session.context({ sessionID });
       const assistant = messages.findLast((message) => message.type === 'assistant' && message.model);
       if (assistant) state.activeModel = assistant.model;
       await update(state);
-    },
+    }),
     remove(sessionID) {
+      cancelReview(sessionID);
       sessions.delete(sessionID);
-      for (const key of clients.keys()) if (key.startsWith(`${sessionID}:`)) clients.delete(key);
     },
     close() {
       controller.abort();
       sessions.clear();
-      clients.clear();
     },
   };
 }

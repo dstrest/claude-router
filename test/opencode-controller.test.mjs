@@ -9,14 +9,21 @@ const models = [
   { providerID: openai.providerID, id: openai.id, name: 'GPT', variants: [{ id: 'high' }] },
 ];
 
-async function harness(initialAdvice, routes = { high: 'openai/gpt-6.1-sol#high' }, fixedAgents = []) {
+async function harness(
+  initialAdvice,
+  routes = { high: 'openai/gpt-6.1-sol#high' },
+  fixedAgents = [],
+  sessionFields = {},
+  dependencies = null,
+) {
   const switches = [];
   const published = [];
-  const current = { advice: initialAdvice, asks: 0 };
+  const current = { advice: initialAdvice, asks: 0, answer: null };
+  const calls = [];
   const ctx = {
     options: {},
     session: {
-      get: async ({ sessionID }) => ({ id: sessionID, model: kimi, agent: 'build' }),
+      get: async ({ sessionID }) => ({ id: sessionID, model: kimi, agent: 'build', ...sessionFields }),
       context: async () => [],
       switchModel: async (input) => switches.push(input),
     },
@@ -25,10 +32,11 @@ async function harness(initialAdvice, routes = { high: 'openai/gpt-6.1-sol#high'
   const controller = await createController(
     ctx,
     { classifier: 'ollama', routes, fixedAgents },
-    {
-      ask: async () => {
+    dependencies ?? {
+      ask: async (input) => {
         current.asks += 1;
-        return { advice: current.advice, error: null };
+        calls.push(input);
+        return current.answer ? current.answer(input) : { advice: current.advice, error: null };
       },
     },
   );
@@ -38,7 +46,11 @@ async function harness(initialAdvice, routes = { high: 'openai/gpt-6.1-sol#high'
     controller,
     switches,
     published,
+    calls,
     asks: () => current.asks,
+    setAnswer: (answer) => {
+      current.answer = answer;
+    },
     setAdvice: (next) => {
       current.advice = next;
     },
@@ -241,5 +253,215 @@ test('a failed model switch is not counted', async () => {
   await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
   assert.equal(published.at(-1).switches, 0);
   assert.equal(published.at(-1).reason, 'model switch failed');
+  controller.close();
+});
+
+const step = (controller, model = kimi, messages = []) =>
+  controller.context({ sessionID: 'ses_test', agent: 'build', model, messages });
+const settle = async () => {
+  for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+const steps = async (controller, count) => {
+  for (let request = 0; request < count; request += 1) {
+    await step(controller);
+    await settle();
+  }
+};
+const quietConsole = (t) => t.mock.method(console, 'error', () => {});
+
+test('the classifier reads dialogue from stored session messages', async () => {
+  const { controller, ctx, calls } = await harness(highAdvice);
+  ctx.session.context = async () => [
+    { type: 'user', text: 'Earlier question' },
+    { type: 'model-switched', model: kimi },
+    { type: 'assistant', content: [{ type: 'text', text: 'Earlier answer' }, { type: 'tool' }] },
+    { type: 'idle', outcome: 'succeeded' },
+  ];
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  assert.deepEqual(calls[0].turns, [
+    { role: 'user', text: 'Earlier question' },
+    { role: 'assistant', text: 'Earlier answer' },
+  ]);
+  controller.close();
+});
+
+test('the classifier reads dialogue from provider messages during a review', async () => {
+  const { controller, calls } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const messages = [
+    { role: 'system', content: [{ type: 'text', text: 'Instructions' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Earlier question' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Earlier answer' }] },
+    { role: 'tool', content: [{ type: 'tool-result' }] },
+  ];
+  for (let request = 0; request < 4; request += 1) await step(controller, openai, messages);
+  await settle();
+  assert.deepEqual(calls.at(-1).turns, [
+    { role: 'user', text: 'Earlier question' },
+    { role: 'assistant', text: 'Earlier answer' },
+  ]);
+  controller.close();
+});
+
+test('a prompt during a review cancels it, and later reviews still run', async () => {
+  const { controller, calls, setAnswer } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  setAnswer(() => new Promise(() => {}));
+  await steps(controller, 4);
+  assert.equal(calls.length, 2);
+  const inFlight = calls[1];
+  assert.equal(inFlight.signal.aborted, false);
+  setAnswer(null);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Next' } });
+  assert.equal(inFlight.signal.aborted, true);
+  await steps(controller, 4);
+  assert.equal(calls.length, 4);
+  controller.close();
+});
+
+test('a review is cancelled when the turn ends', async () => {
+  const { controller, calls, setAnswer } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  setAnswer(() => new Promise(() => {}));
+  await steps(controller, 4);
+  await controller.idle('ses_test');
+  assert.equal(calls[1].signal.aborted, true);
+  controller.close();
+});
+
+test('a failed review changes nothing, including a pin set while it ran', async () => {
+  const { controller, setAnswer, published } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const before = await controller.snapshot('ses_test');
+  setAnswer(async () => {
+    await controller.setPin('ses_test', 'low');
+    return { advice: null, error: 'timeout' };
+  });
+  await steps(controller, 4);
+  const after = await controller.snapshot('ses_test');
+  assert.equal(after.pendingPin, 'low');
+  assert.equal(after.reason, before.reason);
+  assert.equal(after.error, null);
+  assert.equal(after.decisions.length, before.decisions.length);
+  assert.equal(published.at(-1).pendingPin, 'low');
+  controller.close();
+});
+
+test('a review that throws changes nothing', async (t) => {
+  const log = quietConsole(t);
+  const { controller, setAnswer } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const before = await controller.snapshot('ses_test');
+  setAnswer(async () => {
+    throw new Error('boom');
+  });
+  await steps(controller, 4);
+  const after = await controller.snapshot('ses_test');
+  assert.equal(after.reason, before.reason);
+  assert.equal(after.error, null);
+  assert.equal(log.mock.callCount(), 1);
+  controller.close();
+});
+
+test('a successful review keeps a pin set while it ran', async () => {
+  const { controller, setAnswer } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  setAnswer(async () => {
+    await controller.setPin('ses_test', 'low');
+    return { advice: highAdvice, error: null };
+  });
+  await steps(controller, 4);
+  assert.equal((await controller.snapshot('ses_test')).pendingPin, 'low');
+  controller.close();
+});
+
+test('a pinned turn is not reviewed, and the next turn is', async () => {
+  const { controller, asks } = await harness(highAdvice);
+  await controller.setPin('ses_test', 'high');
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await steps(controller, 8);
+  assert.equal(asks(), 0);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'More' } });
+  await steps(controller, 4);
+  assert.equal(asks(), 2);
+  controller.close();
+});
+
+test('a subagent session is never reviewed during its run', async () => {
+  const { controller, asks } = await harness(highAdvice, undefined, [], { parentID: 'ses_parent' });
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const atSpawn = asks();
+  await steps(controller, 8);
+  assert.equal(asks(), atSpawn);
+  controller.close();
+});
+
+test('a session without a model and with partial routes still reaches the classifier', async () => {
+  const { controller, asks, switches } = await harness(highAdvice, { high: 'openai/gpt-6.1-sol#high' }, [], {
+    model: undefined,
+  });
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  assert.equal(asks(), 1);
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
+  controller.close();
+});
+
+test('a tier that resolves to no model keeps the session model', async () => {
+  const advice = { choice: 'low', confidence: 0.9, probabilities: { low: 0.9 } };
+  const { controller, switches } = await harness(advice, { high: 'openai/gpt-6.1-sol#high' }, [], { model: undefined });
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const state = await controller.snapshot('ses_test');
+  assert.equal(switches.length, 0);
+  assert.equal(state.nextModel ?? null, null);
+  assert.equal(state.reason, 'model unavailable');
+  controller.close();
+});
+
+test('routine classifier states stay silent and real failures use the display wording', async () => {
+  const { controller, setAnswer } = await harness(highAdvice);
+  for (const error of ['busy', 'cancelled']) {
+    setAnswer(() => ({ advice: null, error }));
+    await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+    assert.equal((await controller.snapshot('ses_test')).error, null, error);
+  }
+  setAnswer(() => ({ advice: null, error: 'timeout' }));
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  assert.equal((await controller.snapshot('ses_test')).error, 'Ollama timed out');
+  controller.close();
+});
+
+test('the failure breaker is shared across sessions and names when it reopens', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('nope', { status: 400 }));
+  const { controller } = await harness(highAdvice, undefined, [], {}, {});
+  for (let failure = 0; failure < 3; failure += 1)
+    await controller.prompt({ sessionID: 'ses_first', prompt: { text: 'Work' } });
+  const sent = fetch.mock.callCount();
+  await controller.prompt({ sessionID: 'ses_second', prompt: { text: 'Work' } });
+  assert.equal(fetch.mock.callCount(), sent);
+  assert.match((await controller.snapshot('ses_second')).error, /^Ollama paused after failures until .+\d/);
+  controller.close();
+});
+
+test('a host failure never rejects a hook, which would lose the prompt, or ends the event loop', async (t) => {
+  const log = quietConsole(t);
+  const { controller, ctx } = await harness(highAdvice);
+  ctx.session.get = async () => {
+    throw new Error('host down');
+  };
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
+  await controller.idle('ses_test');
+  assert.equal(log.mock.callCount(), 3);
+  controller.close();
+});
+
+test('a failed publish does not reject a hook', async (t) => {
+  quietConsole(t);
+  const { controller } = await harness(highAdvice);
+  controller.setPublisher(async () => {
+    throw new Error('rpc closed');
+  });
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
   controller.close();
 });
