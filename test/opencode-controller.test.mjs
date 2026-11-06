@@ -1834,6 +1834,8 @@ test('history deleted by one project stays deleted, and later replies still coun
     { classifier: 'ollama' },
     { ask: async () => ({ advice: fullAdvice(lowAdvice), error: null }) },
   );
+  // A record and a reset in the same millisecond do not order; real ones are far apart.
+  await new Promise((resolve) => setTimeout(resolve, 5));
   await other.deleteHistory('ses_other');
   await new Promise((resolve) => setTimeout(resolve, 2));
   await send(controller, 'After');
@@ -1917,4 +1919,24 @@ test('a turn-end event for a session this controller only read does not touch it
   assert.equal(money((await controller.usage('ses_test', 'all')).spendUsd), 0.5);
   controller.close();
   other.close();
+});
+
+test('a subagent session loads when its parent is already known', async () => {
+  const { controller, ctx, reply, step } = await harness(lowAdvice, undefined, [], { parentID: 'ses_parent' });
+  const get = ctx.session.get;
+  ctx.session.get = async (input) =>
+    input.sessionID === 'ses_parent'
+      ? { id: 'ses_parent', agent: 'build', model: openai }
+      : { ...(await get(input)), model: kimi };
+  await controller.snapshot('ses_parent');
+  const state = await controller.snapshot('ses_test');
+  assert.deepEqual(state.activeModel, kimi);
+  assert.equal(state.parentID, 'ses_parent');
+  await send(controller);
+  assert.equal((await controller.snapshot('ses_test')).reason, 'subagent');
+  await step();
+  reply(costed(0.4));
+  await controller.idle('ses_test');
+  assert.ok((await controller.usage('ses_test', 'session')).spendUsd >= 0.4);
+  controller.close();
 });

@@ -201,7 +201,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     });
   }
 
-  function ensure(sessionID) {
+  async function ensure(sessionID) {
     if (sessions.has(sessionID)) return sessions.get(sessionID);
     // One read per session: a TUI snapshot can race the prompt hook, and each decision must land on the same state.
     if (!loading.has(sessionID))
