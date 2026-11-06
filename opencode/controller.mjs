@@ -1,11 +1,23 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { acceptActivity } from '../lib/activity.mjs';
-import { emptySession, LATENCY_BOUNDS, latencyP95, recordTurn } from '../lib/activity-stats.mjs';
+import {
+  emptyMetrics,
+  emptyStore,
+  latencyP95,
+  mergeMetrics,
+  mergeStores,
+  metricsAfterReset,
+  readMetrics,
+  readStore,
+  recordMetrics,
+  recordStore,
+  storeAfterReset,
+  storeSummary,
+} from '../lib/activity-stats.mjs';
 import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
 import { activeClassifier, DEFAULTS, ROUTING_MODES, TIERS } from '../lib/config.mjs';
-import { classifierStatus, classifierWarns, NOT_A_TIER_REASON } from '../lib/display.mjs';
+import { classifierStatus, classifierTimed, classifierWarns, NOT_A_TIER_REASON } from '../lib/display.mjs';
 import { observedActivity, promptIndex, routingBucket } from '../lib/facts.mjs';
 import { applyMode, modeLabel, readProjectMode, resolveRoutingMode } from '../lib/modes.mjs';
 import {
@@ -81,6 +93,8 @@ const PROFILE_KEY = 'profile';
 const sessionKey = (sessionID) => `session:${sessionID}`;
 const USAGE_PREFIX = 'usage:';
 const usageKey = (sessionID) => `${USAGE_PREFIX}${sessionID}`;
+const STATS_PREFIX = 'stats:';
+const statsKey = (sessionID) => `${STATS_PREFIX}${sessionID}`;
 const HISTORY_RESET_KEY = 'history-reset';
 // shortcut: OpenCode reports no cache lifetime, so writes price at five minutes; atHostCost corrects the total.
 const CACHE_TTL = '5m';
@@ -115,8 +129,8 @@ const initialState = (session) => ({
   usage: emptyUsage(),
   turnEntries: [],
   turnSwitched: null,
-  stats: emptySession(),
-  adviceBuckets: Array(LATENCY_BOUNDS.length + 1).fill(0),
+  activityStore: emptyStore(),
+  metrics: emptyMetrics(),
   lastAnswer: null,
   loop: null,
   observedAt: null,
@@ -213,6 +227,9 @@ export async function createController(ctx, options = {}, dependencies = {}) {
             const state = initialState(session);
             const saved = await ctx.storage.get(sessionKey(sessionID)).catch(() => null);
             state.usage = readUsage(await ctx.storage.get(usageKey(sessionID)).catch(() => null));
+            const stats = await ctx.storage.get(statsKey(sessionID)).catch(() => null);
+            state.activityStore = readStore(stats?.store);
+            state.metrics = readMetrics(stats?.metrics);
             if (saved) restore(state, saved);
             else if (await startsOff(state))
               Object.assign(state, { mode: 'manual', phase: 'manual', reason: NOT_A_TIER_REASON });
@@ -229,7 +246,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     state.sequence += 1;
     state.updatedAt = Date.now();
     await publish(await sessionSnapshot(state));
-    const { usage: _usage, ...saved } = state;
+    const { usage: _usage, activityStore: _store, metrics: _metrics, ...saved } = state;
     await ctx.storage.set(sessionKey(state.sessionID), JSON.parse(JSON.stringify(saved))).catch((error) => {
       console.error('OpenCode router could not save a session', error);
     });
@@ -263,7 +280,14 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     previousProfile = before;
   }
 
-  async function sessionSnapshot({ loop: _loop, usage: _usage, turnEntries: _entries, ...state }) {
+  async function sessionSnapshot({
+    loop: _loop,
+    usage: _usage,
+    turnEntries: _entries,
+    activityStore: _store,
+    metrics: _metrics,
+    ...state
+  }) {
     const { routing, projectError } = await routingModeOf(state);
     return {
       ...structuredClone(state),
@@ -323,7 +347,11 @@ export async function createController(ctx, options = {}, dependencies = {}) {
           turns,
           signal,
         });
-    return { advice: result.advice, error: classifierProblem(cfg, result.error) };
+    return {
+      advice: result.advice,
+      error: classifierProblem(cfg, result.error),
+      timed: classifierTimed(result.error),
+    };
   }
 
   function record(state, origin, decision, ref) {
@@ -429,15 +457,19 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     state.turnEntries = state.turnEntries.filter((entry) => !resetAt || entry.at >= resetAt);
     const { lastAnswer, turnSwitched: switched, turnEntries: entries } = state;
     if (lastAnswer) {
-      const observed = routingBucket(observedActivity(messages, promptIndex(messages)));
-      state.stats = recordTurn(state.stats, {
-        activity: lastAnswer.activity,
-        answer: lastAnswer.activity,
-        observed,
-        tierSwitches: 0,
-        activitySwitches: 0,
+      const now = Date.now();
+      const observed = observedActivity(messages, promptIndex(messages));
+      const { predicted, adviceMs } = lastAnswer;
+      const store = recordStore(storeAfterReset(state.activityStore, resetAt), { predicted, observed }, now);
+      const metrics = recordMetrics(metricsAfterReset(state.metrics, resetAt), {
+        classifier: config.classifier,
+        adviceMs,
+        now,
       });
-      state.lastAnswer = null;
+      Object.assign(state, { activityStore: store, metrics, lastAnswer: null });
+      await ctx.storage.set(statsKey(state.sessionID), { store, metrics }).catch((error) => {
+        console.error('OpenCode router could not save classifier stats', error);
+      });
     }
     state.turnSwitched = null;
     if (!entries.length) return;
@@ -454,11 +486,11 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     return (await ctx.storage.get(HISTORY_RESET_KEY).catch(() => null)) ?? null;
   }
 
-  async function allUsageKeys() {
+  async function savedEntries(prefix) {
     const keys = [];
     let after;
     do {
-      const page = await ctx.storage.scan({ prefix: USAGE_PREFIX, after, limit: 100 });
+      const page = await ctx.storage.scan({ prefix, after, limit: 100 });
       keys.push(...page.entries);
       after = page.next;
     } while (after);
@@ -600,10 +632,19 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     if (moved !== loop) await commit(state, moved, 'observed');
   }
 
-  function timeAdvice(state, startedAt) {
-    const ms = Date.now() - startedAt;
-    const bucket = LATENCY_BOUNDS.findIndex((bound) => ms <= bound);
-    state.adviceBuckets[bucket === -1 ? LATENCY_BOUNDS.length : bucket] += 1;
+  // The classifier's readings, for one session or, outside `session`, every session since the last reset.
+  async function classifierReadings(state, period, resetAt) {
+    const others = (await savedEntries(STATS_PREFIX)).filter(({ key }) => !key.endsWith(state.sessionID));
+    const stats = period === 'session' ? [] : others.map((entry) => entry.value);
+    const store = mergeStores([...stats.map((value) => value?.store), state.activityStore], resetAt);
+    const metrics = mergeMetrics([...stats.map((value) => value?.metrics), state.metrics], resetAt);
+    const { agreement, disagreements } = storeSummary(store);
+    return {
+      agreement,
+      disagreements,
+      latency: latencyP95(metrics.latency[config.classifier]),
+      statsScope: period === 'session' ? 'session' : 'all',
+    };
   }
 
   // A spawn's model, from its task text alone. The wait delays the subagent's start, so it is capped.
@@ -711,25 +752,26 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       const state = await ensure(sessionID);
       const resetAt = await historyResetAt();
       // Other sessions come from storage; this one from memory, which is ahead of what it saved.
-      const others = period === 'session' ? [] : (await allUsageKeys()).filter(({ key }) => !key.endsWith(sessionID));
+      const others =
+        period === 'session' ? [] : (await savedEntries(USAGE_PREFIX)).filter(({ key }) => !key.endsWith(sessionID));
       const merged = mergeUsage([...others.map((entry) => entry.value), state.usage], resetAt);
       const record = withReplies(merged, state.turnEntries);
       return {
         ...usageReport(record, period, Date.now()),
-        agreement: state.stats.agreement,
-        latency: latencyP95(state.adviceBuckets),
+        ...(await classifierReadings(state, period, resetAt)),
       };
     },
     // Every saved record goes, and a session still holding one in memory cannot write it back over the reset time.
     async deleteHistory(sessionID) {
       await ctx.storage.set(HISTORY_RESET_KEY, Date.now());
-      await Promise.all((await allUsageKeys()).map((entry) => ctx.storage.remove(entry.key)));
+      const saved = [...(await savedEntries(USAGE_PREFIX)), ...(await savedEntries(STATS_PREFIX))];
+      await Promise.all(saved.map((entry) => ctx.storage.remove(entry.key)));
       for (const state of sessions.values())
         Object.assign(state, {
           usage: emptyUsage(),
           turnEntries: [],
-          stats: emptySession(),
-          adviceBuckets: Array(LATENCY_BOUNDS.length + 1).fill(0),
+          activityStore: emptyStore(),
+          metrics: emptyMetrics(),
         });
       return { sessionID };
     },
@@ -791,9 +833,13 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         });
         const askedAt = Date.now();
         const result = pin ? { advice: null, error: null } : await ask(state, turn.cfg, turn.facts);
-        if (!pin) timeAdvice(state, askedAt);
-        const answer = acceptActivity(turn.cfg, result.advice);
-        state.lastAnswer = answer ? { activity: answer } : null;
+        // The raw answer: agreement also has to count one too weak to apply. A pin asked nothing.
+        state.lastAnswer = pin
+          ? null
+          : {
+              predicted: result.advice?.activity?.choice ?? null,
+              adviceMs: result.timed ? Date.now() - askedAt : null,
+            };
         if (state.generation !== generation || state.mode !== 'auto') return;
         state.error = result.error;
         await commit(state, choose(state, turn, { advice: result.advice, pin }), 'prompt', result.advice);

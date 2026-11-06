@@ -1940,3 +1940,84 @@ test('a subagent session loads when its parent is already known', async () => {
   assert.ok((await controller.usage('ses_test', 'session')).spendUsd >= 0.4);
   controller.close();
 });
+
+test('the cash gate uses the real write price of the target model', async () => {
+  const routes = { low: 'openrouter/moonshotai/kimi-k3.1-pro#high', high: 'openai/gpt-6.1-sol#high' };
+  const { controller, switches, reply } = await harness(highAdvice, routes);
+  // $5 input at 1.25x: about $1.88 cold, which the largest Claude multiplier of 2x would price at $3.
+  reply({ tokens: { input: 2, output: 10, reasoning: 0, cache: { read: 300_000, write: 0 } } });
+  await send(controller);
+  await send(controller, 'Second vote');
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
+  controller.close();
+});
+
+const opsAdvice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.9 } } };
+const opsTurn = async (t, sessionID = 'ses_test') => {
+  await send(t.controller, 'Run it', sessionID);
+  t.stored.push({ type: 'user', text: 'Run it' });
+  t.reply({ content: [shellCall(`c${t.stored.length}`, 'npm install')] });
+  await t.controller.idle(sessionID);
+};
+
+test('classifier readings cover every session outside the session period', async () => {
+  const first = await harness(opsAdvice);
+  await opsTurn(first);
+  const other = await createController(
+    first.ctx,
+    { classifier: 'ollama' },
+    { ask: async () => ({ advice: fullAdvice(opsAdvice), error: null }) },
+  );
+  await send(other, 'Run it', 'ses_other');
+  await other.idle('ses_other');
+  const all = await other.usage('ses_other', 'today');
+  assert.equal(all.statsScope, 'all');
+  assert.equal(all.agreement.total, 2);
+  assert.equal(all.latency.turns, 2);
+  const own = await other.usage('ses_other', 'session');
+  assert.equal(own.statsScope, 'session');
+  assert.equal(own.agreement.total, 1);
+  first.controller.close();
+  other.close();
+});
+
+test('classifier readings survive a restart and go with delete history', async () => {
+  const t = await harness(opsAdvice);
+  await opsTurn(t);
+  t.controller.close();
+  const next = await t.restart();
+  assert.equal((await next.usage('ses_test', 'session')).agreement.total, 1);
+  assert.equal((await next.usage('ses_test', 'all')).agreement.total, 1);
+  await next.deleteHistory('ses_test');
+  assert.equal((await next.usage('ses_test', 'all')).agreement.total, 0);
+  assert.deepEqual(
+    [...t.ctx.storage.entries.keys()].filter((key) => key.startsWith('stats:')),
+    [],
+  );
+  next.close();
+});
+
+test('a check counts as a check, so a review that only ran tests agrees', async () => {
+  const advice = { ...lowAdvice, activity: { choice: 'review', probabilities: { review: 0.9 } } };
+  const { controller, stored, reply } = await harness(advice);
+  await send(controller);
+  stored.push({ type: 'user', text: 'Review it' });
+  reply({ content: [shellCall('c1', 'npm test')] });
+  await controller.idle('ses_test');
+  const { agreement } = await controller.usage('ses_test', 'session');
+  assert.deepEqual(agreement, { matched: 1, total: 1 });
+  controller.close();
+});
+
+test('a low-confidence answer still counts, and a pinned turn does not', async () => {
+  const advice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.3 } } };
+  const low = await harness(advice);
+  await opsTurn(low);
+  assert.equal((await low.controller.usage('ses_test', 'session')).agreement.total, 1);
+  low.controller.close();
+  const pinned = await harness(opsAdvice);
+  await pinned.controller.setPin('ses_test', 'low');
+  await opsTurn(pinned);
+  assert.equal((await pinned.controller.usage('ses_test', 'session')).agreement.total, 0);
+  pinned.controller.close();
+});

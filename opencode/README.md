@@ -82,7 +82,7 @@ Commands:
 - `/router mode cost|balanced|quality|default`: set this session's routing mode. See below.
 - `/router classifier [id]`: pick the classifier, from a list when no id is given.
 - `/router timeout <ms>`: set the active classifier's timeout.
-- `/router usage [session|today|7d|30d|month|all]`: show spend, routing against no routing, what the same work would cost on other models, and classifier agreement for this session. Spend is what OpenCode reports; the comparison and What if lines are estimates from list prices, scaled to it. Subagents compare against the model their parent would have run.
+- `/router usage [session|today|7d|30d|month|all]`: show spend, routing against no routing, what the same work would cost on other models, and how often the classifier's activity matched what the turn's tools did. `session` reads this session; any other period reads classifier results across all sessions since the last history delete. Spend is what OpenCode reports; the comparison and What if lines are estimates from each model's catalog prices, scaled to it. Subagents compare against the model their parent would have run.
 - `/router history delete`: delete the usage kept for every session.
 - `/router undo`: undo the last saved change. Only the last one is kept, and not across a restart. It covers saved settings, not a session's routing mode.
 - `/router reset`: clear every saved setting, so `opencode.jsonc` applies again. A session's routing mode stays; use `/router mode default` for that.
