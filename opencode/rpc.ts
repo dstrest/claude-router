@@ -3,6 +3,7 @@ import { Rpc } from '@opencode/plugin/rpc';
 const session = { type: 'string' } as const;
 const state = { type: 'object', additionalProperties: true } as const;
 const tiers = ['micro', 'low', 'medium', 'high'] as const;
+const errors = { rejected: { type: 'null' } } as const;
 const sessionInput = (properties: Record<string, unknown>, required: string[] = []) =>
   ({
     type: 'object',
@@ -14,7 +15,7 @@ const sessionInput = (properties: Record<string, unknown>, required: string[] = 
 export const RouterRpc = Rpc.define({
   id: 'router',
   methods: {
-    snapshot: { input: sessionInput({}), output: state },
+    snapshot: { input: sessionInput({}), output: state, errors },
     models: {
       input: { type: 'object', additionalProperties: false },
       output: {
@@ -33,51 +34,54 @@ export const RouterRpc = Rpc.define({
         required: ['models'],
         additionalProperties: false,
       },
+      errors,
     },
     mode: {
       input: sessionInput({ mode: { type: 'string', enum: ['auto', 'manual'] } }, ['mode']),
       output: state,
+      errors,
     },
     pin: {
       input: sessionInput({ tier: { anyOf: [{ type: 'string', enum: tiers }, { type: 'null' }] } }, ['tier']),
       output: state,
-      errors: { invalid_pin: { type: 'null' } },
+      errors,
     },
     routingMode: {
       input: sessionInput({ mode: { type: 'string' } }, ['mode']),
       output: state,
-      errors: { invalid_setting: { type: 'null' } },
+      errors,
     },
     classifier: {
       input: sessionInput({ id: { type: 'string' } }, ['id']),
       output: state,
-      errors: { invalid_setting: { type: 'null' } },
+      errors,
     },
     timeout: {
       input: sessionInput({ timeoutMs: { type: 'number' } }, ['timeoutMs']),
       output: state,
-      errors: { invalid_setting: { type: 'null' } },
+      errors,
     },
-    reset: { input: sessionInput({}), output: state },
+    reset: { input: sessionInput({}), output: state, errors },
     usage: {
       input: sessionInput({ period: { type: 'string' } }, ['period']),
       output: state,
-      errors: { invalid_setting: { type: 'null' } },
+      errors,
     },
-    deleteHistory: { input: sessionInput({}), output: state },
+    deleteHistory: { input: sessionInput({}), output: state, errors },
     undo: {
       input: sessionInput({}),
       output: state,
-      errors: { invalid_setting: { type: 'null' } },
+      errors,
     },
     route: {
       input: sessionInput({ tier: { type: 'string', enum: tiers }, model: { type: 'string' } }, ['tier', 'model']),
       output: state,
-      errors: { invalid_route: { type: 'null' } },
+      errors,
     },
     activity: {
       input: sessionInput({ mode: { type: 'string', enum: ['on', 'off'] } }, ['mode']),
       output: state,
+      errors,
     },
   },
   events: {

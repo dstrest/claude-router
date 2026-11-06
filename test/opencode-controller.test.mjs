@@ -562,12 +562,16 @@ test('the failure breaker is shared across sessions and names when it reopens', 
 test('a host failure never rejects a hook, which would lose the prompt, or ends the event loop', async (t) => {
   const log = quietConsole(t);
   const { controller, ctx } = await harness(highAdvice);
+  await send(controller);
+  ctx.session.context = async () => {
+    throw new Error('host down');
+  };
+  await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
+  await controller.idle('ses_test');
   ctx.session.get = async () => {
     throw new Error('host down');
   };
-  await send(controller);
-  await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
-  await controller.idle('ses_test');
+  await send(controller, 'More', 'ses_new');
   assert.equal(log.mock.callCount(), 3);
   controller.close();
 });
@@ -1787,4 +1791,130 @@ test('a session reporting the default variant routes like one with no variant', 
   assert.equal(asks(), 1);
   assert.deepEqual(switches, [{ sessionID: 'ses_test', model: kimi }]);
   controller.close();
+});
+
+test("two projects on one server keep each other's settings", async () => {
+  const first = await harness(highAdvice, planRoutes);
+  const second = await createController(first.ctx, { classifier: 'ollama', routes: planRoutes });
+  await first.controller.setRoute('ses_test', 'high', 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  await second.setActivity('ses_other', 'off');
+  await first.controller.setRoute('ses_test', 'low', 'openai/gpt-6.1-sol#high');
+  const third = await createController(first.ctx, { classifier: 'ollama', routes: planRoutes });
+  const { routes, activityRouting } = await third.snapshot('ses_third');
+  assert.equal(routes.high, 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  assert.equal(routes.low, 'openai/gpt-6.1-sol#high');
+  assert.equal(activityRouting, 'off');
+  for (const controller of [first.controller, second, third]) controller.close();
+});
+
+test("a project sees another project's settings from its next turn", async () => {
+  const first = await harness(highAdvice, planRoutes);
+  const second = await createController(
+    first.ctx,
+    { classifier: 'ollama', routes: planRoutes },
+    { ask: async () => ({ advice: fullAdvice(highAdvice), error: null }) },
+  );
+  await first.controller.setRoute('ses_test', 'high', 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  await send(second, 'Work', 'ses_other');
+  const { routes } = await second.snapshot('ses_other');
+  assert.equal(routes.high, 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  first.controller.close();
+  second.close();
+});
+
+test('history deleted by one project stays deleted, and later replies still count', async () => {
+  const first = await harness(lowAdvice);
+  const { controller, reply, step, ctx } = first;
+  await send(controller);
+  reply(costed(0.5));
+  await step();
+  await controller.idle('ses_test');
+  const other = await createController(
+    ctx,
+    { classifier: 'ollama' },
+    { ask: async () => ({ advice: fullAdvice(lowAdvice), error: null }) },
+  );
+  await other.deleteHistory('ses_other');
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await send(controller, 'After');
+  reply(costed(0.25));
+  await step();
+  await controller.idle('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.equal(money(report.spendUsd), 0.25);
+  assert.equal(money((await other.usage('ses_other', 'all')).spendUsd), 0.25);
+  controller.close();
+  other.close();
+});
+
+test('delete history also clears the classifier readings', async () => {
+  const advice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.9 } } };
+  const { controller, stored, reply, step } = await harness(advice);
+  await send(controller);
+  stored.push({ type: 'user', text: 'Run it' });
+  reply({ content: [shellCall('c1', 'npm install')] });
+  await step();
+  await controller.idle('ses_test');
+  await controller.deleteHistory('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.deepEqual(report.agreement, { matched: 0, total: 0 });
+  assert.equal(report.latency, null);
+  controller.close();
+});
+
+test('a move with no new advice does not keep the old tier probability', async () => {
+  const routes = { low: 'openrouter/cheap/tiny', high: 'openrouter/moonshotai/kimi-k3.1-pro#high' };
+  const advice = { choice: 'low', confidence: 0.74, probabilities: { low: 0.74 } };
+  const { controller, reply, step } = await harness(advice, routes, [], { model: tiny });
+  await send(controller);
+  assert.equal((await controller.snapshot('ses_test')).tierProbability, 0.74);
+  reply({ tokens: { input: 2, output: 500, reasoning: 0, cache: { read: 300_000, write: 0 } } });
+  await step();
+  const state = await controller.snapshot('ses_test');
+  assert.notEqual(state.tier, 'low');
+  assert.equal(state.tierProbability, null);
+  controller.close();
+});
+
+test('the classifier choice stays visible when the route does not follow it', async () => {
+  const { controller } = await harness(highAdvice, { ...planRoutes }, [], {});
+  await send(controller, 'First');
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.adviceChoice, 'high');
+  controller.close();
+});
+
+test('a finished turn marks the usage as changed', async () => {
+  const { controller, reply } = await harness(lowAdvice);
+  await send(controller);
+  const before = (await controller.snapshot('ses_test')).usageVersion;
+  reply(costed(0.1));
+  await controller.idle('ses_test');
+  assert.ok((await controller.snapshot('ses_test')).usageVersion > before);
+  controller.close();
+});
+
+test('a turn-end event for a session this controller only read does not touch it', async () => {
+  const owner = await harness(lowAdvice);
+  const { controller, ctx, reply, step } = owner;
+  await send(controller);
+  reply(costed(0.5));
+  await step();
+  const other = await createController(
+    ctx,
+    { classifier: 'ollama' },
+    { ask: async () => ({ advice: null, error: null }) },
+  );
+  const before = (await other.snapshot('ses_test')).decisions.length;
+  await controller.idle('ses_test');
+  await send(controller, 'Second');
+  const saved = () => ctx.storage.entries.get('session:ses_test');
+  const decisions = saved().decisions.length;
+  assert.ok(decisions > before);
+  await other.idle('ses_test');
+  await other.resetHistory('ses_test');
+  assert.equal(saved().decisions.length, decisions);
+  assert.equal(money((await controller.usage('ses_test', 'all')).spendUsd), 0.5);
+  controller.close();
+  other.close();
 });

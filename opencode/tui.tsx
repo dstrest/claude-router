@@ -1,8 +1,9 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from '@opencode/plugin/tui';
 import type { BoxRenderable } from '@opentui/core';
-import { createEffect, createSignal, For, Show } from 'solid-js';
+import { createEffect, createSignal, For, onCleanup, Show } from 'solid-js';
 import { shortReason } from '../lib/display.mjs';
+import { PERIODS } from '../lib/usage.mjs';
 import { formatModelRef } from './config.mjs';
 import { RouterRpc } from './rpc.ts';
 import { fit, switchNotice } from './status.mjs';
@@ -30,6 +31,8 @@ type RouterState = {
   nextModel: ModelRef | null;
   tier: string | null;
   tierConfidence: number | null;
+  adviceChoice: string | null;
+  usageVersion: number;
   tierProbability: number | null;
   activity: string | null;
   activityChoice: string | null;
@@ -47,15 +50,24 @@ export default Plugin.define({
   id: 'router.tui',
   setup(context) {
     const router = context.client.rpc(RouterRpc);
-    const requestOptions = { location: context.location ?? context.data.location.default() };
+    const startLocation = context.location ?? context.data.location.default();
+    // A session answers from its own project, which need not be the one the TUI started in.
+    const requestOptions = (sessionID: string) => ({
+      location: context.data.session.get(sessionID)?.location ?? startLocation,
+    });
+    const [panelFocused, setPanelFocused] = createSignal(false);
     const [states, setStates] = createSignal<Record<string, RouterState>>({});
     const [loadErrors, setLoadErrors] = createSignal<Record<string, string | undefined>>({});
     const [decisionRows, setDecisionRows] = createSignal(8);
     const [usage, setUsage] = createSignal<Record<string, string[]>>({});
     const [period, setPeriod] = createSignal('session');
     const loadUsage = async (sessionID: string) => {
-      const report = await router.usage({ sessionID, period: period() }, requestOptions);
-      setUsage((current) => ({ ...current, [sessionID]: usageLines(report) }));
+      try {
+        const report = await router.usage({ sessionID, period: period() }, requestOptions(sessionID));
+        setUsage((current) => ({ ...current, [sessionID]: usageLines(report) }));
+      } catch (error) {
+        setUsage((current) => ({ ...current, [sessionID]: [errorMessage(error)] }));
+      }
     };
     const update = (result: unknown) => {
       const state = result as RouterState;
@@ -68,12 +80,17 @@ export default Plugin.define({
         return { ...current, [state.sessionID]: state };
       });
     };
+    // The event stream ends if a handler throws, and with it every later update.
     const stop = router.events.on('changed', (event) => {
-      if (event.location.directory === requestOptions.location.directory) update(event.data.state);
+      try {
+        update(event.data.state);
+      } catch (error) {
+        console.error('OpenCode router could not show an update', error);
+      }
     });
     const load = async (sessionID: string) => {
       try {
-        update(await router.snapshot({ sessionID }, requestOptions));
+        update(await router.snapshot({ sessionID }, requestOptions(sessionID)));
         setLoadErrors((current) => ({ ...current, [sessionID]: undefined }));
       } catch (error) {
         setLoadErrors((current) => ({ ...current, [sessionID]: errorMessage(error) }));
@@ -105,15 +122,20 @@ export default Plugin.define({
       );
     }
 
-    function Panel(props: { sessionID: string }) {
+    function Panel(props: { sessionID: string; focused: boolean }) {
       createEffect(() => void load(props.sessionID));
-      createEffect(() => void loadUsage(props.sessionID).catch(() => {}));
+      createEffect(() => {
+        void states()[props.sessionID]?.usageVersion;
+        void loadUsage(props.sessionID);
+      });
+      createEffect(() => setPanelFocused(props.focused));
+      onCleanup(() => setPanelFocused(false));
       const state = () => states()[props.sessionID];
       return (
         <Show when={state()} fallback={<text>{loadErrors()[props.sessionID] ?? 'Loading router…'}</text>}>
           {(value) => (
             <box flexDirection="column">
-              <text>{`Classifier: ${value().classifier.label} · confidence ${percent(value().tierConfidence)}`}</text>
+              <text>{`Classifier: ${value().classifier.label} · chose ${value().adviceChoice ?? '—'} · confidence ${percent(value().tierConfidence)}`}</text>
               <text>{`Tier: ${value().tier ?? '—'} (${percent(value().tierProbability)}) · activity: ${value().activityChoice ?? '—'} (${percent(value().activityProbability)}) · applied: ${value().activity ?? 'base route'}`}</text>
               <text>{`Active: ${formatModelRef(value().activeModel)}`}</text>
               <text>{`Next: ${formatModelRef(value().nextModel)}`}</text>
@@ -163,62 +185,65 @@ export default Plugin.define({
       append: 'session.panel',
       render: (input) => (
         <Show when={input.name === 'router'}>
-          <Panel sessionID={input.sessionID} />
+          <Panel sessionID={input.sessionID} focused={input.focused} />
         </Show>
       ),
     });
 
     const run = async (sessionID: string, input: string) => {
+      const options = requestOptions(sessionID);
       const [command, ...args] = input.trim().split(/\s+/);
       if (!command) {
         await context.ui.panel.open('router');
         return;
       }
       if (command === 'auto' || command === 'off') {
-        update(await router.mode({ sessionID, mode: command === 'auto' ? 'auto' : 'manual' }, requestOptions));
+        update(await router.mode({ sessionID, mode: command === 'auto' ? 'auto' : 'manual' }, options));
       } else if (command === 'pin') {
-        update(await router.pin({ sessionID, tier: args[0] }, requestOptions));
+        update(await router.pin({ sessionID, tier: args[0] }, options));
       } else if (command === 'unpin') {
-        update(await router.pin({ sessionID, tier: null }, requestOptions));
+        update(await router.pin({ sessionID, tier: null }, options));
       } else if (command === 'activity') {
-        update(await router.activity({ sessionID, mode: args[0] }, requestOptions));
+        update(await router.activity({ sessionID, mode: args[0] }, options));
       } else if (command === 'route') {
-        update(await router.route({ sessionID, tier: args[0], model: args[1] }, requestOptions));
+        update(await router.route({ sessionID, tier: args[0], model: args[1] }, options));
       } else if (command === 'model') {
         const tier = args[0] ?? 'medium';
-        const available = (await router.models({}, requestOptions)) as { models: { ref: string; name: string }[] };
+        const available = (await router.models({}, options)) as { models: { ref: string; name: string }[] };
         const selected = await context.ui.dialog.select({
           title: `Select any model for ${tier}`,
           options: available.models.map((model) => ({ title: model.name, description: model.ref, value: model.ref })),
           current: states()[sessionID]?.routes[tier],
         });
-        if (selected) update(await router.route({ sessionID, tier, model: selected }, requestOptions));
+        if (selected) update(await router.route({ sessionID, tier, model: selected }, options));
       } else if (command === 'mode') {
-        update(await router.routingMode({ sessionID, mode: args[0] ?? 'default' }, requestOptions));
+        update(await router.routingMode({ sessionID, mode: args[0] ?? 'default' }, options));
       } else if (command === 'classifier') {
-        const options = states()[sessionID]?.classifiers ?? [];
+        const choices = states()[sessionID]?.classifiers ?? [];
         const id =
           args[0] ??
           (await context.ui.dialog.select({
             title: 'Select a classifier',
-            options: options.map((entry) => ({ title: entry.label, description: entry.id, value: entry.id })),
+            options: choices.map((entry) => ({ title: entry.label, description: entry.id, value: entry.id })),
             current: states()[sessionID]?.classifier.id,
           }));
-        if (id) update(await router.classifier({ sessionID, id }, requestOptions));
+        if (id) update(await router.classifier({ sessionID, id }, options));
       } else if (command === 'timeout') {
-        update(await router.timeout({ sessionID, timeoutMs: Number(args[0]) }, requestOptions));
+        update(await router.timeout({ sessionID, timeoutMs: Number(args[0]) }, options));
       } else if (command === 'usage') {
-        setPeriod(args[0] ?? 'session');
+        const chosen = args[0] ?? 'session';
+        if (!PERIODS.includes(chosen)) throw new Error(`period must be one of ${PERIODS.join(', ')}`);
+        setPeriod(chosen);
         await loadUsage(sessionID);
         await context.ui.panel.open('router');
         return;
       } else if (command === 'history' && args[0] === 'delete') {
-        await router.deleteHistory({ sessionID }, requestOptions);
+        await router.deleteHistory({ sessionID }, options);
         await loadUsage(sessionID);
       } else if (command === 'reset') {
-        update(await router.reset({ sessionID }, requestOptions));
+        update(await router.reset({ sessionID }, options));
       } else if (command === 'undo') {
-        update(await router.undo({ sessionID }, requestOptions));
+        update(await router.undo({ sessionID }, options));
       } else if (command === 'decisions') {
         if (args[0]) setDecisionRows(Math.max(1, Number.parseInt(args[0], 10) || 8));
         await context.ui.panel.open('router');
@@ -271,7 +296,7 @@ export default Plugin.define({
     context.keymap.layer(() => ({
       mode: 'global',
       priority: 20,
-      enabled: () => context.ui.panel.current()?.name === 'router',
+      enabled: () => context.ui.panel.current()?.name === 'router' && panelFocused(),
       commands: [{ title: 'Close router panel', bind: 'escape', run: () => context.ui.panel.close() }],
     }));
 

@@ -14,27 +14,25 @@ export default Plugin.define({
   id: 'router',
   async setup(ctx) {
     const controller = await createController(ctx, ctx.options);
+    // A method's failure reaches the user as its message; undeclared, it reads only `RPC call failed`.
+    const guarded =
+      <Input, Output, Failure>(method: (input: Input) => Promise<Output>) =>
+      (input: Input, { error }: { error: (name: 'rejected', message: string, data: null) => Failure }) =>
+        method(input).catch((failure) => error('rejected', failure.message, null));
     const rpc = await ctx.rpc.register(RouterRpc, {
-      snapshot: ({ sessionID }) => controller.snapshot(sessionID),
-      models: () => controller.models(),
-      mode: ({ sessionID, mode }) => controller.setMode(sessionID, mode),
-      pin: ({ sessionID, tier }, { error }) =>
-        controller.setPin(sessionID, tier).catch((failure) => error('invalid_pin', failure.message, null)),
-      route: ({ sessionID, tier, model }, { error }) =>
-        controller.setRoute(sessionID, tier, model).catch((failure) => error('invalid_route', failure.message, null)),
-      activity: ({ sessionID, mode }) => controller.setActivity(sessionID, mode),
-      routingMode: ({ sessionID, mode }, { error }) =>
-        controller.setRoutingMode(sessionID, mode).catch((failure) => error('invalid_setting', failure.message, null)),
-      classifier: ({ sessionID, id }, { error }) =>
-        controller.setClassifier(sessionID, id).catch((failure) => error('invalid_setting', failure.message, null)),
-      timeout: ({ sessionID, timeoutMs }, { error }) =>
-        controller.setTimeout(sessionID, timeoutMs).catch((failure) => error('invalid_setting', failure.message, null)),
-      reset: ({ sessionID }) => controller.reset(sessionID),
-      usage: ({ sessionID, period }, { error }) =>
-        controller.usage(sessionID, period).catch((failure) => error('invalid_setting', failure.message, null)),
-      deleteHistory: ({ sessionID }) => controller.deleteHistory(sessionID),
-      undo: ({ sessionID }, { error }) =>
-        controller.undo(sessionID).catch((failure) => error('invalid_setting', failure.message, null)),
+      snapshot: guarded(({ sessionID }) => controller.snapshot(sessionID)),
+      models: guarded(() => controller.models()),
+      mode: guarded(({ sessionID, mode }) => controller.setMode(sessionID, mode)),
+      pin: guarded(({ sessionID, tier }) => controller.setPin(sessionID, tier)),
+      route: guarded(({ sessionID, tier, model }) => controller.setRoute(sessionID, tier, model)),
+      activity: guarded(({ sessionID, mode }) => controller.setActivity(sessionID, mode)),
+      routingMode: guarded(({ sessionID, mode }) => controller.setRoutingMode(sessionID, mode)),
+      classifier: guarded(({ sessionID, id }) => controller.setClassifier(sessionID, id)),
+      timeout: guarded(({ sessionID, timeoutMs }) => controller.setTimeout(sessionID, timeoutMs)),
+      reset: guarded(({ sessionID }) => controller.reset(sessionID)),
+      usage: guarded(({ sessionID, period }) => controller.usage(sessionID, period)),
+      deleteHistory: guarded(({ sessionID }) => controller.deleteHistory(sessionID)),
+      undo: guarded(({ sessionID }) => controller.undo(sessionID)),
     });
     controller.setPublisher(async (state) => {
       await rpc.events.emit('changed', { sessionID: state.sessionID, state });

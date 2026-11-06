@@ -24,7 +24,16 @@ import {
 } from '../lib/route.mjs';
 import { compareModels } from '../lib/savings.mjs';
 import { classifiedAlias, PASS_LABEL, passReason, SPAWN_DEADLINE_MS, spawnPrompt } from '../lib/subagents.mjs';
-import { emptyUsage, mergeUsage, PERIODS, readUsage, recordUsage, replyEntry, withReplies } from '../lib/usage.mjs';
+import {
+  emptyUsage,
+  mergeUsage,
+  PERIODS,
+  readUsage,
+  recordUsage,
+  replyEntry,
+  usageAfterReset,
+  withReplies,
+} from '../lib/usage.mjs';
 import {
   availableModelIds,
   classifierLabel,
@@ -66,7 +75,7 @@ const failOpen =
   };
 
 // Nothing from an earlier routed turn stays once routing stops choosing.
-const NO_ROUTE = { tier: null, activity: null };
+const NO_ROUTE = { tier: null, activity: null, adviceChoice: null, activityChoice: null, tierConfidence: null };
 
 const PROFILE_KEY = 'profile';
 const sessionKey = (sessionID) => `session:${sessionID}`;
@@ -98,6 +107,9 @@ const initialState = (session) => ({
   switches: 0,
   switching: false,
   fixed: false,
+  owned: false,
+  adviceChoice: null,
+  usageVersion: 0,
   modeOverride: null,
   comparedModel: null,
   usage: emptyUsage(),
@@ -117,16 +129,19 @@ const initialState = (session) => ({
 export async function createController(ctx, options = {}, dependencies = {}) {
   // Saved settings overlay the plugin options, a tier at a time, so a later config edit reaches every other tier.
   const withProfile = (saved) => ({ ...options, ...saved, routes: { ...options.routes, ...saved.routes } });
-  const savedProfile = await ctx.storage.get(PROFILE_KEY).catch(() => null);
-  let profile = savedProfile ?? {};
-  let config;
-  try {
-    config = normalizeOptions(withProfile(profile));
-  } catch (error) {
-    console.error('OpenCode router ignored saved settings', error);
-    profile = {};
-    config = normalizeOptions(options);
+  let profile = {};
+  let config = normalizeOptions(options);
+  // Storage is shared by every project on the server, so another controller may have written since this one read.
+  async function loadProfile() {
+    const saved = await ctx.storage.get(PROFILE_KEY).catch(() => null);
+    try {
+      config = normalizeOptions(withProfile(saved ?? {}));
+      profile = saved ?? {};
+    } catch (error) {
+      console.error('OpenCode router ignored saved settings', error);
+    }
   }
+  await loadProfile();
   let previousProfile = null;
   const sessions = new Map();
   const reviews = new Map();
@@ -174,7 +189,16 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   function restore(state, saved) {
     const { activeModel, nextModel, parentID, agent, sessionID } = state;
     const phase = saved.mode === 'manual' ? 'manual' : 'ready';
-    Object.assign(state, saved, { activeModel, nextModel, parentID, agent, sessionID, phase, switching: false });
+    Object.assign(state, saved, {
+      activeModel,
+      nextModel,
+      parentID,
+      agent,
+      sessionID,
+      phase,
+      switching: false,
+      owned: false,
+    });
   }
 
   function ensure(sessionID) {
@@ -232,9 +256,10 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     await Promise.all([...sessions.values()].map(update));
   }
 
-  async function changeProfile(next) {
+  async function changeProfile(edit) {
+    await loadProfile();
     const before = profile;
-    await saveProfile(next);
+    await saveProfile(edit(profile));
     previousProfile = before;
   }
 
@@ -400,6 +425,8 @@ export async function createController(ctx, options = {}, dependencies = {}) {
 
   // A finished turn in the ledger, and what the classifier said against what its tools did.
   async function finishTurn(state, messages) {
+    const resetAt = await historyResetAt();
+    state.turnEntries = state.turnEntries.filter((entry) => !resetAt || entry.at >= resetAt);
     const { lastAnswer, turnSwitched: switched, turnEntries: entries } = state;
     if (lastAnswer) {
       const observed = routingBucket(observedActivity(messages, promptIndex(messages)));
@@ -415,7 +442,9 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     state.turnSwitched = null;
     if (!entries.length) return;
     state.turnEntries = [];
-    state.usage = recordUsage(state.usage, entries, { switched, now: Date.now() });
+    state.usageVersion += 1;
+    // Another project may have deleted history, so a record from before that must not be added to and kept.
+    state.usage = recordUsage(usageAfterReset(state.usage, resetAt), entries, { switched, now: Date.now() });
     await ctx.storage.set(usageKey(state.sessionID), state.usage).catch((error) => {
       console.error('OpenCode router could not save usage', error);
     });
@@ -461,10 +490,13 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   }
 
   function showDecision(state, decision, advice) {
+    // A move without new advice: the last reading was about another tier.
+    if (advice === undefined && decision.tier !== state.tier) state.tierProbability = null;
     Object.assign(state, { tier: decision.tier, activity: decision.activity ?? null, reason: decision.reason });
     if (advice === undefined) return;
     const activity = advice?.activity;
     Object.assign(state, {
+      adviceChoice: advice?.choice ?? null,
       tierConfidence: advice?.confidence ?? null,
       tierProbability: advice?.probabilities?.[decision.tier] ?? null,
       activityChoice: activity?.choice ?? null,
@@ -646,12 +678,12 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       const ref = parseModelRef(value);
       const choices = modelOptions(await listModels());
       if (!choices.some((choice) => choice.ref === value)) throw new Error(`model is not available: ${value}`);
-      await changeProfile({ ...profile, routes: { ...profile.routes, [tier]: formatModelRef(ref) } });
+      await changeProfile((saved) => ({ ...saved, routes: { ...saved.routes, [tier]: formatModelRef(ref) } }));
       return sessionSnapshot(await ensure(sessionID));
     },
     async setActivity(sessionID, mode) {
       if (!['on', 'off'].includes(mode)) throw new Error('activity mode must be "on" or "off"');
-      await changeProfile({ ...profile, activityRouting: mode });
+      await changeProfile((saved) => ({ ...saved, activityRouting: mode }));
       return sessionSnapshot(await ensure(sessionID));
     },
     async setRoutingMode(sessionID, mode) {
@@ -663,13 +695,15 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       return sessionSnapshot(state);
     },
     async setClassifier(sessionID, id) {
-      await changeProfile({ ...profile, classifier: id });
+      await changeProfile((saved) => ({ ...saved, classifier: id }));
       return sessionSnapshot(await ensure(sessionID));
     },
     async setTimeout(sessionID, timeoutMs) {
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('a timeout must be a positive number of ms');
-      const classifierTimeouts = { ...profile.classifierTimeouts, [config.classifier]: timeoutMs };
-      await changeProfile({ ...profile, classifierTimeouts });
+      await changeProfile((saved) => ({
+        ...saved,
+        classifierTimeouts: { ...saved.classifierTimeouts, [config.classifier]: timeoutMs },
+      }));
       return sessionSnapshot(await ensure(sessionID));
     },
     async usage(sessionID, period) {
@@ -690,14 +724,17 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     async deleteHistory(sessionID) {
       await ctx.storage.set(HISTORY_RESET_KEY, Date.now());
       await Promise.all((await allUsageKeys()).map((entry) => ctx.storage.remove(entry.key)));
-      for (const state of sessions.values()) {
-        state.usage = emptyUsage();
-        state.turnEntries = [];
-      }
+      for (const state of sessions.values())
+        Object.assign(state, {
+          usage: emptyUsage(),
+          turnEntries: [],
+          stats: emptySession(),
+          adviceBuckets: Array(LATENCY_BOUNDS.length + 1).fill(0),
+        });
       return { sessionID };
     },
     async reset(sessionID) {
-      await changeProfile({});
+      await changeProfile(() => ({}));
       return sessionSnapshot(await ensure(sessionID));
     },
     async undo(sessionID) {
@@ -709,6 +746,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     },
     prompt: failOpen(async (event) => {
       const state = await ensure(event.sessionID);
+      state.owned = true;
       const session = await ctx.session.get({ sessionID: event.sessionID });
       // A prompt into a running turn is not a turn: it keeps the route, the pin and any review. A queued prompt starts
       // later with no hook of its own, so a review routes it.
@@ -727,6 +765,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       if (manual && state.mode === 'auto') turnOff(state, 'model selected manually');
       if (state.mode === 'manual' && !state.parentID) state.nativeModel = state.nextModel ?? state.nativeModel;
       turnConfigs.delete(state.sessionID);
+      await loadProfile();
       state.fixed = config.fixedAgents.includes(state.agent) || Boolean((await agentDefinition(state.agent))?.model);
       // A subagent keeps the model it spawned on: a switch between its steps would rewrite its context cold.
       if (state.mode === 'manual' || state.parentID || state.fixed) {
@@ -768,6 +807,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     }),
     context: failOpen(async (event) => {
       const state = await ensure(event.sessionID);
+      state.owned = true;
       state.agent = event.agent;
       state.activeModel = event.model;
       if (!state.nextModel) state.nextModel = event.model;
@@ -802,8 +842,11 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       await update(parent);
     }),
     idle: failOpen(async (sessionID) => {
+      // Events reach every project's controller, but hooks only the session's own. Another project's copy must not
+      // write over the session's saved state or count its replies again.
+      const state = sessions.get(sessionID);
+      if (!state?.owned) return;
       cancelReview(sessionID);
-      const state = await ensure(sessionID);
       if (state.phase === 'choosing') Object.assign(state, { phase: 'ready', reason: 'interrupted' });
       const { stored, messages } = await read(state);
       const assistant = stored.findLast((message) => message.type === 'assistant' && message.model);
@@ -814,7 +857,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     // Compaction or a rewind replaced the history: the votes and cached prefixes were about the old one.
     resetHistory: failOpen(async (sessionID) => {
       const state = sessions.get(sessionID);
-      if (!state?.loop) return;
+      if (!state?.owned || !state.loop) return;
       cancelReview(sessionID);
       state.loop = resetHistory(state.loop);
       await update(state);
