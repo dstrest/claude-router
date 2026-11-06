@@ -112,7 +112,7 @@ async function harness(
   controller.setPublisher(async (state) => published.push(state));
   // One provider request that finished: the stored reply lib/route.mjs measures.
   const reply = (fields = {}) => {
-    current.clock += 1;
+    current.clock = Math.max(current.clock + 1, Date.now());
     stored.push({
       type: 'assistant',
       model: selected.model,
