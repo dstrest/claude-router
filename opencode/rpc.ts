@@ -59,6 +59,12 @@ export const RouterRpc = Rpc.define({
       errors: { invalid_setting: { type: 'null' } },
     },
     reset: { input: sessionInput({}), output: state },
+    usage: {
+      input: sessionInput({ period: { type: 'string' } }, ['period']),
+      output: state,
+      errors: { invalid_setting: { type: 'null' } },
+    },
+    deleteHistory: { input: sessionInput({}), output: state },
     undo: {
       input: sessionInput({}),
       output: state,

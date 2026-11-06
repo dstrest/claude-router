@@ -10,6 +10,7 @@ import {
   sameModel,
 } from '../opencode/config.mjs';
 import { promptHasImages, routerMessages, stopReasonOf, usageOf } from '../opencode/messages.mjs';
+import { atHostCost, usageLines } from '../opencode/usage.mjs';
 
 const kimi = 'openrouter/moonshotai/kimi-k3.1-pro#high';
 const current = parseModelRef(kimi);
@@ -278,4 +279,47 @@ test('a running default variant is the same model as a route without a variant',
   const route = parseModelRef('openrouter/deepseek/deepseek-v4.1-flash-1017');
   assert.equal(sameModel({ ...route, variant: 'default' }, route), true);
   assert.equal(sameModel({ ...route, variant: 'high' }, route), false);
+});
+
+test('a reply scales to the host cost, keeping its parts in proportion', () => {
+  const reply = { routedUsd: 2, yoursUsd: 4, cheaperUsd: -3, strongerUsd: 0, switchUsd: 1 };
+  assert.deepEqual(atHostCost(reply, 1), {
+    routedUsd: 1,
+    yoursUsd: 2,
+    cheaperUsd: -1.5,
+    strongerUsd: 0,
+    switchUsd: 0.5,
+  });
+  assert.equal(atHostCost(reply, undefined), reply);
+  assert.equal(atHostCost({ ...reply, routedUsd: 0 }, 1).yoursUsd, 4);
+});
+
+test('the usage report reads as routing against no routing', () => {
+  const lines = usageLines({
+    period: 'session',
+    spendUsd: 1.25,
+    replies: 4,
+    early: true,
+    routedUsd: 1.25,
+    yoursUsd: 2,
+    differenceUsd: -0.75,
+    cheaperUsd: -0.8,
+    strongerUsd: 0,
+    switchUsd: 0.05,
+    share: -0.375,
+    whatIf: [{ model: 'openrouter/cheap/tiny', usd: 0.5 }],
+    insights: [{ kind: 'switch', share: 0.2, usd: 0.05 }],
+    agreement: { matched: 3, total: 4 },
+    latency: { ms: 2000, over: false, turns: 4 },
+  });
+  assert.equal(lines[0], 'Usage (session): $1.25 over 4 replies · early sample');
+  assert.equal(lines[1], 'Routing vs no routing: $1.25 vs $2.00 · -$0.75 (-38%)');
+  assert.equal(lines[2], 'Cheaper models -$0.80 · stronger $0.00 · switches +$0.05');
+  assert.ok(lines.includes('What if: openrouter/cheap/tiny $0.50'));
+  assert.ok(lines.some((line) => /Classifier agreed on 3 of 4 turns · p95 2.0s/.test(line)));
+  assert.ok(lines.some((line) => /Switch cache writes took 20%/.test(line)));
+});
+
+test('an empty report says so', () => {
+  assert.deepEqual(usageLines({ period: 'today', spendUsd: 0, replies: 0 }), ['Usage (today): no replies yet']);
 });

@@ -1,8 +1,10 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { acceptActivity } from '../lib/activity.mjs';
+import { emptySession, LATENCY_BOUNDS, latencyP95, recordTurn } from '../lib/activity-stats.mjs';
 import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
-import { activeClassifier, ROUTING_MODES, TIERS } from '../lib/config.mjs';
+import { activeClassifier, DEFAULTS, ROUTING_MODES, TIERS } from '../lib/config.mjs';
 import { classifierStatus, classifierWarns, NOT_A_TIER_REASON } from '../lib/display.mjs';
 import { observedActivity, promptIndex, routingBucket } from '../lib/facts.mjs';
 import { applyMode, modeLabel, readProjectMode, resolveRoutingMode } from '../lib/modes.mjs';
@@ -20,7 +22,9 @@ import {
   prepareLoop,
   resetHistory,
 } from '../lib/route.mjs';
+import { compareModels } from '../lib/savings.mjs';
 import { classifiedAlias, PASS_LABEL, passReason, SPAWN_DEADLINE_MS, spawnPrompt } from '../lib/subagents.mjs';
+import { emptyUsage, mergeUsage, PERIODS, readUsage, recordUsage, replyEntry, withReplies } from '../lib/usage.mjs';
 import {
   availableModelIds,
   classifierLabel,
@@ -34,6 +38,7 @@ import {
   variantOf,
 } from './config.mjs';
 import { promptHasImages, routerMessages, stopReasonOf, usageOf } from './messages.mjs';
+import { atHostCost, usageReport } from './usage.mjs';
 
 function sleep(ms, { signal }) {
   return new Promise((resolve, reject) => {
@@ -65,6 +70,11 @@ const NO_ROUTE = { tier: null, activity: null };
 
 const PROFILE_KEY = 'profile';
 const sessionKey = (sessionID) => `session:${sessionID}`;
+const USAGE_PREFIX = 'usage:';
+const usageKey = (sessionID) => `${USAGE_PREFIX}${sessionID}`;
+const HISTORY_RESET_KEY = 'history-reset';
+// shortcut: OpenCode reports no cache lifetime, so writes price at five minutes; atHostCost corrects the total.
+const CACHE_TTL = '5m';
 const DECISIONS_KEPT = 100;
 
 const initialState = (session) => ({
@@ -89,6 +99,13 @@ const initialState = (session) => ({
   switching: false,
   fixed: false,
   modeOverride: null,
+  comparedModel: null,
+  usage: emptyUsage(),
+  turnEntries: [],
+  turnSwitched: null,
+  stats: emptySession(),
+  adviceBuckets: Array(LATENCY_BOUNDS.length + 1).fill(0),
+  lastAnswer: null,
   loop: null,
   observedAt: null,
   generation: 0,
@@ -145,6 +162,14 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     }
   }
 
+  // What "no routing" would have run. A subagent would have inherited its parent's model, unless its agent names one.
+  async function comparedModelOf(state, session) {
+    if (!session.parentID) return null;
+    if ((await agentDefinition(state.agent))?.model) return state.nativeModel;
+    const parent = await ensure(session.parentID).catch(() => null);
+    return parent?.comparedModel ?? parent?.nativeModel ?? state.nativeModel;
+  }
+
   // What a session keeps across a restart. The models stay as the host reports them now.
   function restore(state, saved) {
     const { activeModel, nextModel, parentID, agent, sessionID } = state;
@@ -163,9 +188,11 @@ export async function createController(ctx, options = {}, dependencies = {}) {
           .then(async (session) => {
             const state = initialState(session);
             const saved = await ctx.storage.get(sessionKey(sessionID)).catch(() => null);
+            state.usage = readUsage(await ctx.storage.get(usageKey(sessionID)).catch(() => null));
             if (saved) restore(state, saved);
             else if (await startsOff(state))
               Object.assign(state, { mode: 'manual', phase: 'manual', reason: NOT_A_TIER_REASON });
+            state.comparedModel ??= await comparedModelOf(state, session);
             sessions.set(sessionID, state);
             return state;
           })
@@ -178,7 +205,8 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     state.sequence += 1;
     state.updatedAt = Date.now();
     await publish(await sessionSnapshot(state));
-    await ctx.storage.set(sessionKey(state.sessionID), JSON.parse(JSON.stringify(state))).catch((error) => {
+    const { usage: _usage, ...saved } = state;
+    await ctx.storage.set(sessionKey(state.sessionID), JSON.parse(JSON.stringify(saved))).catch((error) => {
       console.error('OpenCode router could not save a session', error);
     });
   }
@@ -210,7 +238,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     previousProfile = before;
   }
 
-  async function sessionSnapshot({ loop: _loop, ...state }) {
+  async function sessionSnapshot({ loop: _loop, usage: _usage, turnEntries: _entries, ...state }) {
     const { routing, projectError } = await routingModeOf(state);
     return {
       ...structuredClone(state),
@@ -302,7 +330,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   async function turnConfig(state) {
     if (!turnConfigs.has(state.sessionID)) {
       const catalog = await listModels();
-      const configured = routerConfig(config, catalog, state.nativeModel);
+      const configured = routerConfig(config, catalog, state.nativeModel, state.comparedModel);
       const { routing } = await routingModeOf(state);
       turnConfigs.set(state.sessionID, {
         cfg: state.pendingPin ? configured : applyMode(configured, routing),
@@ -313,27 +341,99 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     return turnConfigs.get(state.sessionID);
   }
 
-  // Replies since the last read. Reading stored messages, not step events, keeps usage in step with the transcript; a
-  // session new to this controller counts only its last reply, which is enough to measure the context.
+  // Replies since the last read. Reading stored messages, not step events, keeps usage in step with the transcript. A
+  // first read that finds replies is a session from before this controller: only its last counts, which is enough to
+  // measure the context. A first read that finds none starts the count from nothing.
   function observe(cfg, loop, state, stored) {
     const replies = stored.filter(
       (message) => message?.type === 'assistant' && message.tokens && message.time?.completed,
     );
-    const unseen = state.observedAt
-      ? replies.filter((message) => message.time.completed > state.observedAt)
-      : replies.slice(-1);
-    state.observedAt = replies.at(-1)?.time.completed ?? state.observedAt;
-    return unseen.reduce(
-      (next, message) =>
-        observeResponse(cfg, next, {
-          usage: usageOf(message),
-          requestedModel: modelId(message.model),
-          effort: variantOf(message.model),
-          stopReason: stopReasonOf(message),
-          now: message.time.completed,
+    const unseen =
+      state.observedAt === null
+        ? replies.slice(-1)
+        : replies.filter((message) => message.time.completed > state.observedAt);
+    state.observedAt = replies.at(-1)?.time.completed ?? state.observedAt ?? 0;
+    return unseen.reduce((next, message) => measure(cfg, next, state, message), loop);
+  }
+
+  function measure(cfg, loop, state, message) {
+    const usage = usageOf(message);
+    const effort = variantOf(message.model);
+    const now = message.time.completed;
+    const observed = observeResponse(cfg, loop, {
+      usage,
+      requestedModel: modelId(message.model),
+      effort,
+      stopReason: stopReasonOf(message),
+      now,
+    });
+    try {
+      const yours = modelId(state.comparedModel ?? state.nativeModel);
+      const served = { model: usage.model, effort };
+      const args = { usage, served, effort: null, ttl: CACHE_TTL, now, yours };
+      const compared = compareModels(cfg, observed.yoursBy ?? {}, args);
+      const byId = Object.entries(compared.replies).map(([alias, reply]) => [
+        cfg.models[alias].id,
+        atHostCost(reply, message.cost),
+      ]);
+      state.turnEntries.push(
+        replyEntry({
+          at: now,
+          mode: cfg.routingMode?.mode ?? DEFAULTS.mode,
+          activity: observed.decision?.activity ?? null,
+          tier: observed.decision?.tier ?? null,
+          route: `${usage.model}@${effort ?? 'session'}`,
+          yours,
+          reply: atHostCost(compared.reply, message.cost),
+          observedUsd: message.cost ?? 0,
+          replies: Object.fromEntries(byId),
+          usage,
         }),
-      loop,
-    );
+      );
+      return { ...observed, yoursBy: compared.states };
+    } catch (error) {
+      // The ledger never breaks a turn.
+      console.error('OpenCode router could not price a reply', error);
+      return observed;
+    }
+  }
+
+  // A finished turn in the ledger, and what the classifier said against what its tools did.
+  async function finishTurn(state, messages) {
+    const { lastAnswer, turnSwitched: switched, turnEntries: entries } = state;
+    if (lastAnswer) {
+      const observed = routingBucket(observedActivity(messages, promptIndex(messages)));
+      state.stats = recordTurn(state.stats, {
+        activity: lastAnswer.activity,
+        answer: lastAnswer.activity,
+        observed,
+        tierSwitches: 0,
+        activitySwitches: 0,
+      });
+      state.lastAnswer = null;
+    }
+    state.turnSwitched = null;
+    if (!entries.length) return;
+    state.turnEntries = [];
+    state.usage = recordUsage(state.usage, entries, { switched, now: Date.now() });
+    await ctx.storage.set(usageKey(state.sessionID), state.usage).catch((error) => {
+      console.error('OpenCode router could not save usage', error);
+    });
+  }
+
+  async function historyResetAt() {
+    return (await ctx.storage.get(HISTORY_RESET_KEY).catch(() => null)) ?? null;
+  }
+
+  async function allUsageKeys() {
+    const keys = [];
+    let after;
+    do {
+      const page = await ctx.storage.scan({ prefix: USAGE_PREFIX, after, limit: 100 });
+      keys.push(...page.entries);
+      after = page.next;
+    } while (after);
+    return keys;
   }
 
   // What a decision reads now: the frozen config, the transcript, and the usage and facts it gives.
@@ -357,7 +457,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       contextTokens: last ? last.tokens + last.outputTokens : empty ? 0 : null,
     });
     if (promptImages) facts.hasImages = true;
-    return { ...turn, facts, messages, empty, contextKnown: Boolean(last) || empty };
+    return { ...turn, facts, messages, stored, empty, contextKnown: Boolean(last) || empty };
   }
 
   function showDecision(state, decision, advice) {
@@ -400,6 +500,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     if (ref && !sameModel(state.nextModel, ref)) {
       try {
         await switchTo(state, ref);
+        state.turnSwitched = decision.tier === previous.lastRoute ? 'activity' : 'tier';
       } catch (error) {
         state.loop = previous;
         state.reason = 'model-unavailable';
@@ -465,6 +566,12 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     const observed = routingBucket(observedActivity(messages, from));
     const moved = observedMove(cfg, loop, { observed, facts, contextKnown, now: Date.now() });
     if (moved !== loop) await commit(state, moved, 'observed');
+  }
+
+  function timeAdvice(state, startedAt) {
+    const ms = Date.now() - startedAt;
+    const bucket = LATENCY_BOUNDS.findIndex((bound) => ms <= bound);
+    state.adviceBuckets[bucket === -1 ? LATENCY_BOUNDS.length : bucket] += 1;
   }
 
   // A spawn's model, from its task text alone. The wait delays the subagent's start, so it is capped.
@@ -565,6 +672,30 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       await changeProfile({ ...profile, classifierTimeouts });
       return sessionSnapshot(await ensure(sessionID));
     },
+    async usage(sessionID, period) {
+      if (!PERIODS.includes(period)) throw new Error(`period must be one of ${PERIODS.join(', ')}`);
+      const state = await ensure(sessionID);
+      const resetAt = await historyResetAt();
+      // Other sessions come from storage; this one from memory, which is ahead of what it saved.
+      const others = period === 'session' ? [] : (await allUsageKeys()).filter(({ key }) => !key.endsWith(sessionID));
+      const merged = mergeUsage([...others.map((entry) => entry.value), state.usage], resetAt);
+      const record = withReplies(merged, state.turnEntries);
+      return {
+        ...usageReport(record, period, Date.now()),
+        agreement: state.stats.agreement,
+        latency: latencyP95(state.adviceBuckets),
+      };
+    },
+    // Every saved record goes, and a session still holding one in memory cannot write it back over the reset time.
+    async deleteHistory(sessionID) {
+      await ctx.storage.set(HISTORY_RESET_KEY, Date.now());
+      await Promise.all((await allUsageKeys()).map((entry) => ctx.storage.remove(entry.key)));
+      for (const state of sessions.values()) {
+        state.usage = emptyUsage();
+        state.turnEntries = [];
+      }
+      return { sessionID };
+    },
     async reset(sessionID) {
       await changeProfile({});
       return sessionSnapshot(await ensure(sessionID));
@@ -595,6 +726,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.agent = session.agent ?? state.agent;
       if (manual && state.mode === 'auto') turnOff(state, 'model selected manually');
       if (state.mode === 'manual' && !state.parentID) state.nativeModel = state.nextModel ?? state.nativeModel;
+      turnConfigs.delete(state.sessionID);
       state.fixed = config.fixedAgents.includes(state.agent) || Boolean((await agentDefinition(state.agent))?.model);
       // A subagent keeps the model it spawned on: a switch between its steps would rewrite its context cold.
       if (state.mode === 'manual' || state.parentID || state.fixed) {
@@ -613,13 +745,16 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         await update(state);
       }
       try {
-        turnConfigs.delete(state.sessionID);
         const turn = await read(state, {
           prompt: event.prompt.text,
           turnId: event.messageID,
           promptImages: promptHasImages(event.prompt.files),
         });
+        const askedAt = Date.now();
         const result = pin ? { advice: null, error: null } : await ask(state, turn.cfg, turn.facts);
+        if (!pin) timeAdvice(state, askedAt);
+        const answer = acceptActivity(turn.cfg, result.advice);
+        state.lastAnswer = answer ? { activity: answer } : null;
         if (state.generation !== generation || state.mode !== 'auto') return;
         state.error = result.error;
         await commit(state, choose(state, turn, { advice: result.advice, pin }), 'prompt', result.advice);
@@ -639,6 +774,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       if (state.mode !== 'manual') state.phase = 'routed';
       const routed = state.mode === 'auto' && !state.parentID && !state.fixed;
       if (routed && state.loop?.decision) await routeStep(state, event.model);
+      else await read(state);
       await update(state);
     }),
     // Runs before the child session exists, so the model applies from its first request, with no cache to lose. The
@@ -669,9 +805,10 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       cancelReview(sessionID);
       const state = await ensure(sessionID);
       if (state.phase === 'choosing') Object.assign(state, { phase: 'ready', reason: 'interrupted' });
-      const messages = await ctx.session.context({ sessionID });
-      const assistant = messages.findLast((message) => message.type === 'assistant' && message.model);
+      const { stored, messages } = await read(state);
+      const assistant = stored.findLast((message) => message.type === 'assistant' && message.model);
       if (assistant) state.activeModel = assistant.model;
+      await finishTurn(state, messages);
       await update(state);
     }),
     // Compaction or a rewind replaced the history: the votes and cached prefixes were about the old one.
@@ -686,6 +823,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       cancelReview(sessionID);
       sessions.delete(sessionID);
       turnConfigs.delete(sessionID);
+      // The usage record stays: a period counts what a deleted session spent.
       return ctx.storage.remove(sessionKey(sessionID)).catch(() => {});
     },
     close() {

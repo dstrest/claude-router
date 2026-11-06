@@ -30,6 +30,9 @@ export default Plugin.define({
       timeout: ({ sessionID, timeoutMs }, { error }) =>
         controller.setTimeout(sessionID, timeoutMs).catch((failure) => error('invalid_setting', failure.message, null)),
       reset: ({ sessionID }) => controller.reset(sessionID),
+      usage: ({ sessionID, period }, { error }) =>
+        controller.usage(sessionID, period).catch((failure) => error('invalid_setting', failure.message, null)),
+      deleteHistory: ({ sessionID }) => controller.deleteHistory(sessionID),
       undo: ({ sessionID }, { error }) =>
         controller.undo(sessionID).catch((failure) => error('invalid_setting', failure.message, null)),
     });

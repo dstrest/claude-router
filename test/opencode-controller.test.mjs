@@ -48,6 +48,11 @@ function memoryStorage() {
     get: async (key) => (entries.has(key) ? structuredClone(entries.get(key)) : null),
     set: async (key, value) => void entries.set(key, structuredClone(value)),
     remove: async (key) => void entries.delete(key),
+    scan: async ({ prefix }) => ({
+      entries: [...entries]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, value]) => ({ key, value: structuredClone(value) })),
+    }),
   };
 }
 
@@ -63,7 +68,7 @@ async function harness(
 ) {
   const switches = [];
   const published = [];
-  const current = { advice: initialAdvice, asks: 0, answer: null, clock: 1000 };
+  const current = { advice: initialAdvice, asks: 0, answer: null, clock: Date.now() };
   const calls = [];
   const stored = [];
   const selected = { model: Object.hasOwn(sessionFields, 'model') ? sessionFields.model : kimi };
@@ -73,7 +78,7 @@ async function harness(
       get: async ({ sessionID }) => ({
         id: sessionID,
         agent: selected.agent ?? 'build',
-        ...sessionFields,
+        ...(sessionID === sessionFields.parentID ? {} : sessionFields),
         model: selected.model,
         time: selected.time,
       }),
@@ -114,6 +119,7 @@ async function harness(
       content: [{ type: 'text', text: 'Done' }],
       tokens: { input: 2, output: 10, reasoning: 0, cache: { read: 1000, write: 10 } },
       finish: 'stop',
+      cost: 0,
       time: { created: current.clock, completed: current.clock },
       ...fields,
     });
@@ -1558,4 +1564,188 @@ test('reset clears saved settings back to the config, and can be undone', async 
   const next = await restart();
   assert.equal((await next.snapshot('ses_test')).routes.high, planRoutes.high);
   next.close();
+});
+
+const costed = (cost, fields = {}) => ({ cost, ...fields });
+const money = (usd) => Math.round(usd * 1e6) / 1e6;
+
+test('session spend adds up to the cost the host reports', async () => {
+  const { controller, reply } = await harness(highAdvice);
+  await send(controller);
+  reply(costed(0.25));
+  reply(costed(0.5));
+  reply(costed(0.125));
+  await controller.idle('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.equal(money(report.spendUsd), 0.875);
+  assert.equal(report.replies, 3);
+  controller.close();
+});
+
+test('every reply counts toward spend, however it was routed', async () => {
+  const measured = async (t) => {
+    const hook = () => t.controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
+    await send(t.controller);
+    await hook();
+    t.reply(costed(0.1));
+    await hook();
+    t.reply(costed(0.2));
+    await hook();
+    t.reply(costed(0.3));
+    await t.controller.idle('ses_test');
+    const report = await t.controller.usage('ses_test', 'session');
+    assert.equal(money(report.spendUsd), 0.6);
+    assert.equal(report.replies, 3);
+    t.controller.close();
+  };
+  await measured(await harness(highAdvice));
+  const off = await harness(highAdvice);
+  await off.controller.setMode('ses_test', 'manual');
+  await measured(off);
+  await measured(await harness(highAdvice, undefined, ['build']));
+});
+
+test('replies that land before the first read all count', async () => {
+  const { controller, reply } = await harness(lowAdvice);
+  await send(controller);
+  reply(costed(0.1));
+  reply(costed(0.2));
+  reply(costed(0.3));
+  await controller.idle('ses_test');
+  assert.equal(money((await controller.usage('ses_test', 'session')).spendUsd), 0.6);
+  controller.close();
+});
+
+test('a session that stayed on its own model reads no difference from no routing', async () => {
+  const { controller, reply, step } = await harness(lowAdvice);
+  await send(controller);
+  for (const cost of [0.1, 0.2, 0.3]) {
+    await step();
+    reply(costed(cost));
+  }
+  await controller.idle('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.equal(report.differenceUsd, 0);
+  assert.equal(report.routedUsd, report.yoursUsd);
+  controller.close();
+});
+
+test('routing to a stronger model reads as a cost against no routing', async () => {
+  const { controller, reply, step } = await harness(highAdvice);
+  await send(controller);
+  await step(openai);
+  reply({
+    ...costed(1),
+    tokens: { input: 1000, output: 1000, reasoning: 0, cache: { read: 0, write: 0 } },
+    model: openai,
+  });
+  await controller.idle('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.ok(report.yoursUsd < report.routedUsd);
+  assert.ok(report.strongerUsd > 0);
+  assert.ok(report.whatIf.some((row) => row.model === modelId(kimi)));
+  controller.close();
+});
+
+test('a reply without a list price is still spend', async () => {
+  const { controller, ctx, reply, step } = await harness(lowAdvice);
+  await send(controller);
+  await step();
+  ctx.model.list = async () => ({ data: [] });
+  await controller.resetHistory('ses_test');
+  reply({ ...costed(0.4), model: { providerID: 'gone', id: 'model' } });
+  await controller.idle('ses_test');
+  assert.equal(money((await controller.usage('ses_test', 'session')).spendUsd), 0.4);
+  controller.close();
+});
+
+test('a period adds every session, and a session period only its own', async () => {
+  const { controller, step, reply, ctx } = await harness(lowAdvice);
+  await send(controller);
+  reply(costed(0.5));
+  await step();
+  await controller.idle('ses_test');
+  await send(controller, 'Other', 'ses_other');
+  ctx.session.context = async () => [
+    {
+      type: 'assistant',
+      model: kimi,
+      cost: 0.25,
+      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { completed: Date.now() + 1000 },
+    },
+  ];
+  await controller.idle('ses_other');
+  assert.equal(money((await controller.usage('ses_other', 'session')).spendUsd), 0.25);
+  assert.equal(money((await controller.usage('ses_test', 'today')).spendUsd), 0.75);
+  await assert.rejects(() => controller.usage('ses_test', 'decade'), /period/);
+  controller.close();
+});
+
+test('usage survives a restart, and delete history clears it for good', async () => {
+  const { controller, restart, reply, step, ctx } = await harness(lowAdvice);
+  await send(controller);
+  reply(costed(0.5));
+  await step();
+  await controller.idle('ses_test');
+  controller.close();
+  const next = await restart();
+  assert.equal(money((await next.usage('ses_test', 'session')).spendUsd), 0.5);
+  await next.deleteHistory('ses_test');
+  assert.equal((await next.usage('ses_test', 'session')).spendUsd, 0);
+  assert.equal((await next.usage('ses_test', 'all')).spendUsd, 0);
+  assert.deepEqual(
+    [...ctx.storage.entries.keys()].filter((key) => key.startsWith('usage:ses')),
+    [],
+  );
+  next.close();
+});
+
+test('a subagent is measured against the model its parent would have run', async () => {
+  const child = await harness(lowAdvice, undefined, [], { parentID: 'ses_parent' });
+  const { controller, ctx, reply, step } = child;
+  const get = ctx.session.get;
+  ctx.session.get = async (input) =>
+    input.sessionID === 'ses_parent'
+      ? { id: 'ses_parent', agent: 'build', model: openai }
+      : { ...(await get(input)), model: kimi };
+  await send(controller);
+  await step();
+  reply({ ...costed(0.4), tokens: { input: 1000, output: 1000, reasoning: 0, cache: { read: 0, write: 0 } } });
+  await controller.idle('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.ok(report.routedUsd < report.yoursUsd);
+  controller.close();
+});
+
+test('a pinned agent is measured against its own model', async () => {
+  const { controller, ctx, reply, step } = await harness(lowAdvice, undefined, [], {
+    parentID: 'ses_parent',
+    agent: 'web',
+  });
+  const get = ctx.session.get;
+  ctx.session.get = async (input) =>
+    input.sessionID === 'ses_parent'
+      ? { id: 'ses_parent', agent: 'build', model: openai }
+      : { ...(await get(input)), model: kimi };
+  await send(controller);
+  await step();
+  reply(costed(0.4));
+  await controller.idle('ses_test');
+  assert.equal((await controller.usage('ses_test', 'session')).differenceUsd, 0);
+  controller.close();
+});
+
+test('the classifier agreement and its wait are reported', async () => {
+  const advice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.9 } } };
+  const { controller, reply, stored, step } = await harness(advice);
+  await send(controller);
+  stored.push({ type: 'user', text: 'Run it' });
+  reply({ content: [shellCall('c1', 'npm install')] });
+  await step();
+  await controller.idle('ses_test');
+  const report = await controller.usage('ses_test', 'session');
+  assert.deepEqual(report.agreement, { matched: 1, total: 1 });
+  assert.equal(report.latency.turns, 1);
+  controller.close();
 });

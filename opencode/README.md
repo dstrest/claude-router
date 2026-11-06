@@ -14,7 +14,7 @@ This is an additive OpenCode V2 adapter. The existing Claude Code plugin remains
 - Re-reviews a running turn every four provider requests and applies a changed route to a subsequent provider turn.
 - Fails open: classifier and model errors retain the active model and appear in the `/router` panel.
 
-Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Tool results drive failure escalation, the checkpoint a same-task move to a cheaper model waits for, and moves up when a turn's tools show stronger work. Usage accounting is not yet ported.
+Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Tool results drive failure escalation, the checkpoint a same-task move to a cheaper model waits for, and moves up when a turn's tools show stronger work. 
 
 ## Install
 
@@ -80,6 +80,8 @@ Commands:
 - `/router mode cost|balanced|quality|default`: set this session's routing mode. See below.
 - `/router classifier [id]`: pick the classifier, from a list when no id is given.
 - `/router timeout <ms>`: set the active classifier's timeout.
+- `/router usage [session|today|7d|30d|month|all]`: show spend, routing against no routing, what the same work would cost on other models, and classifier agreement. Replies are priced at what OpenCode reports. Subagents compare against the model their parent would have run.
+- `/router history delete`: delete the usage kept for every session.
 - `/router undo`: undo the last saved change. Only the last one is kept, and not across a restart.
 - `/router reset`: clear every saved setting, so `opencode.jsonc` applies again.
 

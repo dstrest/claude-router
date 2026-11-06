@@ -6,6 +6,7 @@ import { shortReason } from '../lib/display.mjs';
 import { formatModelRef } from './config.mjs';
 import { RouterRpc } from './rpc.ts';
 import { fit, switchNotice } from './status.mjs';
+import { usageLines } from './usage.mjs';
 
 const tiers = ['micro', 'low', 'medium', 'high'];
 const percent = (value: unknown) => (typeof value === 'number' ? `${Math.round(value * 100)}%` : '—');
@@ -50,6 +51,12 @@ export default Plugin.define({
     const [states, setStates] = createSignal<Record<string, RouterState>>({});
     const [loadErrors, setLoadErrors] = createSignal<Record<string, string | undefined>>({});
     const [decisionRows, setDecisionRows] = createSignal(8);
+    const [usage, setUsage] = createSignal<Record<string, string[]>>({});
+    const [period, setPeriod] = createSignal('session');
+    const loadUsage = async (sessionID: string) => {
+      const report = await router.usage({ sessionID, period: period() }, requestOptions);
+      setUsage((current) => ({ ...current, [sessionID]: usageLines(report) }));
+    };
     const update = (result: unknown) => {
       const state = result as RouterState;
       const notice = switchNotice(states()[state.sessionID], state);
@@ -100,6 +107,7 @@ export default Plugin.define({
 
     function Panel(props: { sessionID: string }) {
       createEffect(() => void load(props.sessionID));
+      createEffect(() => void loadUsage(props.sessionID).catch(() => {}));
       const state = () => states()[props.sessionID];
       return (
         <Show when={state()} fallback={<text>{loadErrors()[props.sessionID] ?? 'Loading router…'}</text>}>
@@ -126,6 +134,7 @@ export default Plugin.define({
                   )}
                 </For>
               </Show>
+              <For each={usage()[props.sessionID] ?? []}>{(line) => <text>{line}</text>}</For>
               <text>Recent decisions</text>
               <Show when={value().decisions.length} fallback={<text> No decisions yet</text>}>
                 <For each={value().decisions.slice(0, decisionRows())}>
@@ -137,7 +146,7 @@ export default Plugin.define({
               <text>
                 Commands: /router auto|off · /router pin &lt;tier&gt; · /router unpin · /router model &lt;tier&gt; ·
                 /router activity on|off · /router mode &lt;mode&gt; · /router classifier · /router timeout &lt;ms&gt; ·
-                /router reset · /router undo · /router decisions [n]
+                /router reset · /router undo · /router decisions [n] · /router usage [period] · /router history delete
               </text>
             </box>
           )}
@@ -198,6 +207,14 @@ export default Plugin.define({
         if (id) update(await router.classifier({ sessionID, id }, requestOptions));
       } else if (command === 'timeout') {
         update(await router.timeout({ sessionID, timeoutMs: Number(args[0]) }, requestOptions));
+      } else if (command === 'usage') {
+        setPeriod(args[0] ?? 'session');
+        await loadUsage(sessionID);
+        await context.ui.panel.open('router');
+        return;
+      } else if (command === 'history' && args[0] === 'delete') {
+        await router.deleteHistory({ sessionID }, requestOptions);
+        await loadUsage(sessionID);
       } else if (command === 'reset') {
         update(await router.reset({ sessionID }, requestOptions));
       } else if (command === 'undo') {
@@ -208,7 +225,7 @@ export default Plugin.define({
         return;
       } else {
         throw new Error(
-          'usage: /router [auto|off|pin <tier>|unpin|model <tier>|route <tier> <model>|activity on|off|mode <mode>|classifier [id]|timeout <ms>|reset|undo|decisions [n]]',
+          'usage: /router [auto|off|pin <tier>|unpin|model <tier>|route <tier> <model>|activity on|off|mode <mode>|classifier [id]|timeout <ms>|reset|undo|decisions [n]|usage [period]|history delete]',
         );
       }
       context.ui.toast.show({ title: 'Router', message: 'Router state updated', variant: 'success' });
