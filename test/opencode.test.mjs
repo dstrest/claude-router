@@ -137,6 +137,123 @@ test('stored messages become the turns lib/facts.mjs reads', () => {
   assert.equal(promptHasImages(undefined), false);
 });
 
+const toolMessage = (...content) => ({ type: 'assistant', content });
+const shell = (id, command, state = {}) => ({
+  type: 'tool',
+  id,
+  name: 'shell',
+  state: { status: 'completed', input: { command }, content: [{ type: 'text', text: 'ok' }], ...state },
+});
+
+test('tool calls become tool_use blocks, each followed by its result', () => {
+  const messages = routerMessages([
+    toolMessage(
+      { type: 'text', text: 'Running' },
+      shell('call_1', 'npm test', { metadata: { exit: 0, truncated: false } }),
+    ),
+  ]);
+  assert.deepEqual(messages, [
+    {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Running' },
+        {
+          type: 'tool_use',
+          id: 'call_1',
+          name: 'Bash',
+          input: { command: 'npm test', run_in_background: false },
+        },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'call_1', is_error: false, content: [{ type: 'text', text: 'ok' }] },
+      ],
+    },
+  ]);
+});
+
+test('a shell failure is an error whatever the tool status says', () => {
+  const failed = (metadata) =>
+    routerMessages([toolMessage(shell('call_1', 'npm test', { metadata }))])[1].content[0].is_error;
+  assert.equal(failed({ exit: 1 }), true);
+  assert.equal(failed({ signal: 'SIGKILL' }), true);
+  assert.equal(failed({ timeout: true }), true);
+  assert.equal(failed({ exit: 0 }), false);
+  assert.equal(failed(undefined), false);
+});
+
+test('a tool error carries its message, and an unfinished call has no result', () => {
+  const [, result] = routerMessages([
+    toolMessage({
+      type: 'tool',
+      id: 'call_1',
+      name: 'edit',
+      state: { status: 'error', input: { path: 'a.mjs' }, error: { type: 'tool', message: 'oldString not found' } },
+    }),
+  ]);
+  assert.deepEqual(result.content, [
+    {
+      type: 'tool_result',
+      tool_use_id: 'call_1',
+      is_error: true,
+      content: [{ type: 'text', text: 'oldString not found' }],
+    },
+  ]);
+  const running = routerMessages([
+    toolMessage({ type: 'tool', id: 'call_2', name: 'shell', state: { status: 'running', input: { command: 'ls' } } }),
+    toolMessage({ type: 'tool', id: 'call_3', name: 'shell', state: { status: 'streaming', input: '{"comm' } }),
+  ]);
+  assert.equal(running.length, 2);
+  assert.equal(running[1].content[0].input.command, undefined);
+});
+
+test('edits and patches name their files, as the activity and checkpoint rules read them', () => {
+  const edited = (name, input) =>
+    routerMessages([toolMessage({ type: 'tool', id: 'c', name, state: { status: 'running', input } })])[0].content;
+  assert.deepEqual(edited('edit', { path: 'a.mjs' }), [
+    { type: 'tool_use', id: 'c', name: 'Edit', input: { file_path: 'a.mjs' } },
+  ]);
+  assert.deepEqual(edited('write', { path: 'b.md' }), [
+    { type: 'tool_use', id: 'c', name: 'Write', input: { file_path: 'b.md' } },
+  ]);
+  const patchText = '*** Begin Patch\n*** Update File: a.mjs\n@@\n-x\n+y\n*** Add File: docs/b.md\n+z\n*** End Patch';
+  assert.deepEqual(
+    edited('patch', { patchText }).map((block) => [block.name, block.input.file_path]),
+    [
+      ['Edit', 'a.mjs'],
+      ['Edit', 'docs/b.md'],
+    ],
+  );
+  assert.equal(edited('subagent', { agent: 'general' })[0].name, 'Agent');
+  assert.equal(edited('grep', { pattern: 'x' })[0].name, 'grep');
+});
+
+test('a background command reads as a launch, and an image result counts as an image', () => {
+  const [call, result] = routerMessages([
+    toolMessage({
+      type: 'tool',
+      id: 'c',
+      name: 'shell',
+      state: {
+        status: 'completed',
+        input: { command: 'npm test', background: true },
+        content: [
+          { type: 'text', text: 'Command moved to the background (shell ID: s).' },
+          { type: 'file', uri: 'media:abc', mime: 'image/png' },
+          { type: 'file', uri: 'media:def', mime: 'text/plain' },
+        ],
+      },
+    }),
+  ]);
+  assert.equal(call.content[0].input.run_in_background, true);
+  assert.deepEqual(result.content[0].content, [
+    { type: 'text', text: 'Command moved to the background (shell ID: s).' },
+    { type: 'image' },
+  ]);
+});
+
 test('step tokens become Anthropic-style usage, and overflow text becomes a stop reason', () => {
   const message = {
     model: kimiRef,

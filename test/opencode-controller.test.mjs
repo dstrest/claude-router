@@ -678,3 +678,139 @@ test('the controller decides as chooseRoute does for the same scenario', async (
     controller.close();
   }
 });
+
+const shellCall = (id, command, metadata = { exit: 0 }, text = 'ok') => ({
+  type: 'tool',
+  id,
+  name: 'shell',
+  state: { status: 'completed', input: { command }, content: [{ type: 'text', text }], metadata },
+});
+const editCall = (id, path) => ({
+  type: 'tool',
+  id,
+  name: 'edit',
+  state: { status: 'completed', input: { path }, content: [{ type: 'text', text: 'edited' }] },
+});
+const toolRoutes = {
+  low: 'openrouter/moonshotai/kimi-k3.1-pro#high',
+  medium: 'openrouter/moonshotai/kimi-k3.1-pro#max',
+  high: 'openai/gpt-6.1-sol#high',
+};
+
+test('repeated identical failures with an edit between them escalate one tier and hold', async () => {
+  const { controller, switches, stored, reply, step } = await harness(lowAdvice, toolRoutes);
+  await send(controller);
+  stored.push({ type: 'user', text: 'Fix the test' });
+  const failure = { exit: 1 };
+  reply({ content: [shellCall('c1', 'npm test', failure, 'FAIL expected 1 got 2')] });
+  reply({ content: [editCall('c2', 'a.mjs')] });
+  reply({ content: [shellCall('c3', 'npm test', failure, 'FAIL expected 1 got 2')] });
+  await send(controller, 'Try again');
+  let state = await controller.snapshot('ses_test');
+  assert.equal(state.reason, 'escalation');
+  assert.equal(state.tier, 'medium');
+  assert.equal(switches.at(-1).model.variant, 'max');
+  await step();
+  await send(controller, 'Once more');
+  state = await controller.snapshot('ses_test');
+  assert.equal(state.reason, 'hold');
+  assert.equal(state.tier, 'medium');
+  controller.close();
+});
+
+test('two different failures do not escalate', async () => {
+  const { controller, reply } = await harness(lowAdvice, toolRoutes);
+  await send(controller);
+  reply({ content: [shellCall('c1', 'npm test', { exit: 1 }, 'FAIL one')] });
+  reply({ content: [editCall('c2', 'a.mjs')] });
+  reply({ content: [shellCall('c3', 'npm test', { exit: 1 }, 'FAIL two')] });
+  await send(controller, 'Try again');
+  assert.notEqual((await controller.snapshot('ses_test')).reason, 'escalation');
+  controller.close();
+});
+
+const downgradeTurn = async (check) => {
+  const advice = { ...highAdvice, continuation: 0.9 };
+  const t = await harness(advice, toolRoutes, [], { model: openai });
+  await send(t.controller);
+  t.stored.push({ type: 'user', text: 'Write the tests' });
+  await t.steps(9);
+  t.setAdvice({ choice: 'low', confidence: 0.97, probabilities: { low: 0.97, high: 0.03 }, continuation: 0.9 });
+  await send(t.controller, 'Vote one');
+  await t.step();
+  if (check) t.reply({ content: [editCall('c1', 'a.mjs'), shellCall('c2', 'npm test', check)] });
+  await send(t.controller, 'Vote two');
+  return t;
+};
+
+test('a same-task downgrade waits for a passed check', async () => {
+  const held = await downgradeTurn(null);
+  assert.equal((await held.controller.snapshot('ses_test')).reason, 'downgrade-held');
+  assert.equal(held.switches.length, 0);
+  held.controller.close();
+  const failed = await downgradeTurn({ exit: 1 });
+  assert.equal((await failed.controller.snapshot('ses_test')).reason, 'downgrade-held');
+  failed.controller.close();
+  const passed = await downgradeTurn({ exit: 0 });
+  assert.equal((await passed.controller.snapshot('ses_test')).reason, 'downgrade');
+  assert.deepEqual(passed.switches.at(-1).model, kimi);
+  passed.controller.close();
+});
+
+test('a turn that edits code moves up to the code route at the next step', async () => {
+  const activities = { code: { low: 'openai/gpt-6.1-sol#high' } };
+  const advice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.9 } } };
+  const { controller, switches, stored, reply, step } = await harness(advice, toolRoutes, [], {}, null, activities);
+  await send(controller);
+  assert.equal(switches.length, 0);
+  stored.push({ type: 'user', text: 'Tidy the config' });
+  reply({ content: [editCall('c1', 'src/app.mjs')] });
+  await step();
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.activity, 'code');
+  assert.equal(state.reason, 'activity-up');
+  assert.equal(state.decisions[0].origin, 'observed');
+  controller.close();
+});
+
+test('a read-only turn stays on its route, and an observed move only goes up', async () => {
+  const activities = { code: { low: 'openrouter/cheap/tiny' } };
+  const advice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.9 } } };
+  const { controller, switches, stored, reply, step } = await harness(advice, toolRoutes, [], {}, null, activities);
+  await send(controller);
+  stored.push({ type: 'user', text: 'Tidy the config' });
+  reply({ content: [shellCall('c1', 'ls')] });
+  await step();
+  reply({ content: [editCall('c2', 'src/app.mjs')] });
+  await step();
+  assert.equal(switches.length, 0);
+  controller.close();
+});
+
+test('a tool call made after a review snapshot can still move the route up', async () => {
+  const activities = { code: { low: 'openai/gpt-6.1-sol#high' } };
+  const advice = { ...lowAdvice, activity: { choice: 'ops', probabilities: { ops: 0.9 } } };
+  const { controller, switches, stored, reply, step, steps, setAnswer } = await harness(
+    { ...advice, continuation: 0 },
+    toolRoutes,
+    [],
+    {},
+    null,
+    activities,
+  );
+  await send(controller);
+  stored.push({ type: 'user', text: 'Tidy the config' });
+  await steps(5);
+  const answered = [];
+  setAnswer((input) => {
+    answered.push(input);
+    reply({ content: [editCall('c1', 'src/app.mjs')] });
+    return { advice: fullAdvice(advice), error: null };
+  });
+  await steps(5);
+  assert.equal(answered.length, 1);
+  await step();
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
+  controller.close();
+});

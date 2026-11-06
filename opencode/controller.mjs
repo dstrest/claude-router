@@ -2,12 +2,15 @@ import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
 import { activeClassifier, TIERS } from '../lib/config.mjs';
 import { classifierStatus, classifierWarns } from '../lib/display.mjs';
+import { observedActivity, promptIndex, routingBucket } from '../lib/facts.mjs';
 import {
+  canMoveUp,
   chooseRoute,
   continueRoute,
   emptyLoop,
   isNativeFallback,
   nativeFacts,
+  observedMove,
   observeResponse,
   prepareLoop,
 } from '../lib/route.mjs';
@@ -254,7 +257,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       contextTokens: last ? last.tokens + last.outputTokens : empty ? 0 : null,
     });
     if (promptImages) facts.hasImages = true;
-    return { ...turn, facts, empty, contextKnown: Boolean(last) || empty };
+    return { ...turn, facts, messages, empty, contextKnown: Boolean(last) || empty };
   }
 
   function showDecision(state, decision, advice) {
@@ -317,6 +320,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     const abort = new AbortController();
     reviews.set(state.sessionID, abort);
     const { generation } = state.loop;
+    const observedUpTo = turn.messages.length;
     state.loop = { ...state.loop, reviewedAt: state.loop.requests };
     try {
       const result = await ask(state, turn.cfg, turn.facts, abort.signal);
@@ -328,11 +332,23 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       if (abort.signal.aborted) return;
       const facts = { ...current.facts, midTurn: true };
       await commit(state, choose(state, current, { advice: result.advice, facts }), 'review', result.advice);
+      // Tool calls up to the review's snapshot were judged by it; later ones can still move the route up.
+      state.loop = { ...state.loop, observedFrom: observedUpTo };
     } catch (error) {
       console.error('OpenCode router review failed', error);
     } finally {
       if (reviews.get(state.sessionID) === abort) reviews.delete(state.sessionID);
     }
+  }
+
+  // A step whose turn shows stronger work than its route was chosen for moves up once.
+  async function moveOnObserved(state, { cfg, messages, facts, contextKnown }) {
+    const { loop } = state;
+    if (!canMoveUp(cfg, loop.decision, null)) return;
+    const from = Math.max(promptIndex(messages), (loop.observedFrom ?? 0) - 1);
+    const observed = routingBucket(observedActivity(messages, from));
+    const moved = observedMove(cfg, loop, { observed, facts, contextKnown, now: Date.now() });
+    if (moved !== loop) await commit(state, moved, 'observed');
   }
 
   async function routeStep(state, model) {
@@ -341,6 +357,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.reason = 'native-fallback';
       return;
     }
+    await moveOnObserved(state, turn);
     const selected = continueRoute(turn.cfg, state.loop, {
       hasImages: turn.facts.hasImages,
       nativeModel: turn.nativeModel,
