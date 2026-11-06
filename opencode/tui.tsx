@@ -1,8 +1,10 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from '@opencode/plugin/tui';
+import type { BoxRenderable } from '@opentui/core';
 import { createEffect, createSignal, For, Show } from 'solid-js';
 import { formatModelRef } from './config.mjs';
 import { RouterRpc } from './rpc.ts';
+import { fit, switchNotice } from './status.mjs';
 
 const tiers = ['micro', 'low', 'medium', 'high'];
 const percent = (value: unknown) => (typeof value === 'number' ? `${Math.round(value * 100)}%` : '—');
@@ -14,6 +16,7 @@ type Decision = { origin: string; tier: string | null; activity: string | null; 
 type RouterState = {
   sessionID: string;
   sequence: number;
+  switches: number;
   mode: string;
   phase: string;
   classifier: { label: string };
@@ -43,6 +46,10 @@ export default Plugin.define({
     const [loadErrors, setLoadErrors] = createSignal<Record<string, string | undefined>>({});
     const update = (result: unknown) => {
       const state = result as RouterState;
+      const notice = switchNotice(states()[state.sessionID], state);
+      const route = context.ui.router.current();
+      if (notice && route.type === 'session' && route.sessionID === state.sessionID)
+        context.ui.toast.show({ title: 'Router', message: notice, variant: 'info' });
       setStates((current) => {
         if ((current[state.sessionID]?.sequence ?? -1) > state.sequence) return current;
         return { ...current, [state.sessionID]: state };
@@ -59,6 +66,31 @@ export default Plugin.define({
         setLoadErrors((current) => ({ ...current, [sessionID]: errorMessage(error) }));
       }
     };
+
+    function Status(props: { sessionID: string }) {
+      createEffect(() => void load(props.sessionID));
+      const [width, setWidth] = createSignal(0);
+      const line = () => {
+        const state = states()[props.sessionID];
+        return state ? fit(state, width()) : '';
+      };
+      return (
+        <Show when={line()}>
+          <box
+            flexShrink={0}
+            minWidth={0}
+            onSizeChange={function (this: BoxRenderable) {
+              const measured = this.width;
+              queueMicrotask(() => setWidth(measured));
+            }}
+          >
+            <text fg={context.theme.text.muted} wrapMode="none" truncate>
+              {line()}
+            </text>
+          </box>
+        </Show>
+      );
+    }
 
     function Panel(props: { sessionID: string }) {
       createEffect(() => void load(props.sessionID));
@@ -104,6 +136,11 @@ export default Plugin.define({
         </Show>
       );
     }
+
+    const status = context.ui.slot({
+      append: 'session.composer.top',
+      render: (input) => <Status sessionID={input.sessionID} />,
+    });
 
     const panel = context.ui.slot({
       append: 'session.panel',
@@ -193,6 +230,7 @@ export default Plugin.define({
 
     return () => {
       stop();
+      status();
       panel();
     };
   },

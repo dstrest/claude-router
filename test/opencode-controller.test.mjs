@@ -34,6 +34,7 @@ async function harness(initialAdvice, routes = { high: 'openai/gpt-6.1-sol#high'
   );
   controller.setPublisher(async (state) => published.push(state));
   return {
+    ctx,
     controller,
     switches,
     published,
@@ -217,5 +218,28 @@ test('Jev through OpenRouter posts System One with the stored OpenRouter key', a
   assert.equal(new Headers(calls[0].init.headers).get('authorization'), 'Bearer stored-key');
   assert.equal(JSON.parse(calls[0].init.body).model, 'typesafe/jev-1.14');
   assert.equal((await controller.snapshot('ses_test')).tier, 'high');
+  controller.close();
+});
+
+const highAdvice = { choice: 'high', confidence: 0.9, probabilities: { high: 0.9 } };
+
+test('the switch count rises only when the model really changed', async () => {
+  const { controller, published } = await harness(highAdvice);
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  assert.equal(published.at(-1).switches, 1);
+  await controller.context({ sessionID: 'ses_test', agent: 'build', model: openai, messages: [] });
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'More work' } });
+  assert.equal(published.at(-1).switches, 1);
+  controller.close();
+});
+
+test('a failed model switch is not counted', async () => {
+  const { controller, ctx, published } = await harness(highAdvice);
+  ctx.session.switchModel = async () => {
+    throw new Error('rejected');
+  };
+  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  assert.equal(published.at(-1).switches, 0);
+  assert.equal(published.at(-1).reason, 'model switch failed');
   controller.close();
 });

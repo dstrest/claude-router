@@ -74,6 +74,7 @@ const initialState = (session) => ({
   reviewing: false,
   requests: 0,
   switchedAtRequest: 0,
+  switches: 0,
   policy: initialPolicy(),
   generation: 0,
   sequence: 0,
@@ -202,6 +203,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       try {
         await ctx.session.switchModel({ sessionID: state.sessionID, model: state.nextModel });
         state.switchedAtRequest = state.requests;
+        state.switches += 1;
       } catch (error) {
         state.nextModel = state.activeModel;
         state.reason = 'model switch failed';

@@ -16,7 +16,7 @@ export const formatModelRef = (ref) =>
   ref ? `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ''}` : 'none';
 
 // OpenCode reports a model without a variant as `default` once it is running.
-const variantOf = (ref) => (ref?.variant === 'default' ? null : (ref?.variant ?? null));
+export const variantOf = (ref) => (ref?.variant === 'default' ? null : (ref?.variant ?? null));
 
 export const sameModel = (a, b) => a?.providerID === b?.providerID && a?.id === b?.id && variantOf(a) === variantOf(b);
 
