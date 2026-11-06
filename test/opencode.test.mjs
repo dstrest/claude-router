@@ -336,3 +336,20 @@ test('a route with no variant on the session model keeps the session variant', (
   const other = routerConfig(config, [], parseModelRef('openai/gpt-6.1-sol#high'));
   assert.equal(other.activities.debug.low.model, 'openrouter/moonshotai/kimi-k3.1-pro');
 });
+
+test('the default variant is available wherever the model is', () => {
+  const ref = parseModelRef('openrouter/deepseek/deepseek-v4.1-flash-1017');
+  const catalog = [
+    {
+      ...ref,
+      variants: [{ id: 'high' }],
+      limit: { context: 1_000_000 },
+      cost: [{ input: 0.3, output: 1.2, cache: { read: 0.01, write: 0.3 } }],
+    },
+  ];
+  const config = normalizeOptions({ routes: { low: formatModelRef(ref) } });
+  const cfg = routerConfig(config, catalog, { ...ref, variant: 'default' });
+  assert.deepEqual(Object.keys(cfg.models), [formatModelRef(ref)]);
+  assert.equal(cfg.models[formatModelRef(ref)].id, 'openrouter/deepseek/deepseek-v4.1-flash-1017');
+  assert.equal(cfg.models[formatModelRef(ref)].contextWindow, 1_000_000);
+});

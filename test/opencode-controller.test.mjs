@@ -1770,3 +1770,21 @@ test('a session keeps its variant when a route names its model without one', asy
   assert.deepEqual(state.nextModel, kimi);
   controller.close();
 });
+
+test('a session reporting the default variant routes like one with no variant', async () => {
+  const flash = { providerID: 'openai', id: 'gpt-6.1-sol', variant: 'default' };
+  const routes = {
+    micro: 'openai/gpt-6.1-sol',
+    low: 'openai/gpt-6.1-sol',
+    medium: 'openai/gpt-6.1-sol',
+    high: 'openrouter/moonshotai/kimi-k3.1-pro#high',
+  };
+  const { controller, switches, asks } = await harness(highAdvice, routes, [], { model: flash });
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.mode, 'auto');
+  assert.notEqual(state.reason, 'not a routing tier');
+  await send(controller);
+  assert.equal(asks(), 1);
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: kimi }]);
+  controller.close();
+});

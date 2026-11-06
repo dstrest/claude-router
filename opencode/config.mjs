@@ -49,7 +49,7 @@ function available(models, ref) {
   if (!ref) return false;
   return models.some((model) => {
     if (model.providerID !== ref.providerID || model.id !== ref.id || model.enabled === false) return false;
-    return !ref.variant || variantIDs(model).includes(ref.variant);
+    return !variantOf(ref) || variantIDs(model).includes(variantOf(ref));
   });
 }
 
