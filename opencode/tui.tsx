@@ -2,6 +2,7 @@
 import { Plugin } from '@opencode/plugin/tui';
 import type { BoxRenderable } from '@opentui/core';
 import { createEffect, createSignal, For, Show } from 'solid-js';
+import { shortReason } from '../lib/display.mjs';
 import { formatModelRef } from './config.mjs';
 import { RouterRpc } from './rpc.ts';
 import { fit, switchNotice } from './status.mjs';
@@ -103,7 +104,7 @@ export default Plugin.define({
               <text>{`Tier: ${value().tier ?? '—'} (${percent(value().tierProbability)}) · activity: ${value().activityChoice ?? '—'} (${percent(value().activityProbability)}) · applied: ${value().activity ?? 'base route'}`}</text>
               <text>{`Active: ${formatModelRef(value().activeModel)}`}</text>
               <text>{`Next: ${formatModelRef(value().nextModel)}`}</text>
-              <text>{`Why: ${value().reason ?? '—'}${value().error ? ` · ${value().error}` : ''}`}</text>
+              <text>{`Why: ${shortReason(value().reason, value().activity) || '—'}${value().error ? ` · ${value().error}` : ''}`}</text>
               <text>{`Pin: ${value().pendingPin ?? 'none'} · activity routing: ${value().activityRouting}`}</text>
               <text>Routes</text>
               <For each={tiers}>
@@ -123,7 +124,7 @@ export default Plugin.define({
               <Show when={value().decisions.length} fallback={<text> No decisions yet</text>}>
                 <For each={value().decisions.slice(0, 8)}>
                   {(decision) => (
-                    <text>{`  ${decision.origin} · ${decision.tier ?? '—'} · ${decision.activity ?? 'base'} · ${decision.model} · ${decision.reason}`}</text>
+                    <text>{`  ${decision.origin} · ${decision.tier ?? '—'} · ${decision.activity ?? 'base'} · ${decision.model} · ${shortReason(decision.reason, decision.activity)}`}</text>
                   )}
                 </For>
               </Show>

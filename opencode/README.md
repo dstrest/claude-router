@@ -13,7 +13,7 @@ This is an additive OpenCode V2 adapter. The existing Claude Code plugin remains
 - Re-reviews a running turn every four provider requests and applies a changed route to a subsequent provider turn.
 - Fails open: classifier and model errors retain the active model and appear in the `/router` panel.
 
-Failure escalation, context-fit checks, cost gates, checkpoint detection, usage accounting, and route-file editing from the Claude adapter are not yet ported. Switches are treated as free because OpenCode routes carry no prices yet. Route changes made through `/router route` or `/router model` are in-memory for this preview, not persisted to `router.json`.
+Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Failure escalation, checkpoint detection, usage accounting, and route-file editing from the Claude adapter are not yet ported, so a same-task move to a cheaper model waits. Route changes made through `/router route` or `/router model` are in-memory for this preview, not persisted to `router.json`.
 
 ## Install
 

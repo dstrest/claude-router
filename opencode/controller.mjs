@@ -2,45 +2,28 @@ import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
 import { activeClassifier, TIERS } from '../lib/config.mjs';
 import { classifierStatus, classifierWarns } from '../lib/display.mjs';
-import { initialState as initialPolicy } from '../lib/policy.mjs';
 import {
-  classifierConfig,
+  chooseRoute,
+  continueRoute,
+  emptyLoop,
+  isNativeFallback,
+  nativeFacts,
+  observeResponse,
+  prepareLoop,
+} from '../lib/route.mjs';
+import {
+  availableModelIds,
   classifierLabel,
-  decideRoute,
   formatModelRef,
+  modelId,
   modelOptions,
   normalizeOptions,
   parseModelRef,
+  routerConfig,
   sameModel,
+  variantOf,
 } from './config.mjs';
-
-const clip = (text, limit) => {
-  const value = String(text ?? '');
-  return value.length <= limit ? value : `${value.slice(0, limit / 2)}\n…\n${value.slice(-limit / 2)}`;
-};
-
-// Stored messages (`session.context()`) give a user turn as `text`; provider messages (`context.messages`) use parts.
-function messageText(message) {
-  const role = message?.type ?? message?.role;
-  if (!['user', 'assistant'].includes(role)) return null;
-  if (typeof message.text === 'string') return { role, text: message.text };
-  const content = Array.isArray(message.content) ? message.content : [];
-  const text = content
-    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text)
-    .join('\n');
-  return { role, text };
-}
-
-function dialogue(messages, prompt, config) {
-  const turns = messages
-    .map(messageText)
-    .filter((message) => message?.text)
-    .map((message) => ({ ...message, text: clip(message.text, config.context.maxTextChars) }));
-  const last = turns.at(-1);
-  if (last?.role === 'user' && last.text === clip(prompt, config.context.maxTextChars)) turns.pop();
-  return turns.slice(-config.context.recentTurns);
-}
+import { promptHasImages, routerMessages, stopReasonOf, usageOf } from './messages.mjs';
 
 function sleep(ms, { signal }) {
   return new Promise((resolve, reject) => {
@@ -86,11 +69,9 @@ const initialState = (session) => ({
   reason: 'ready',
   error: null,
   pendingPin: null,
-  pinned: false,
-  requests: 0,
-  switchedAtRequest: 0,
   switches: 0,
-  policy: initialPolicy(),
+  loop: null,
+  observedAt: null,
   generation: 0,
   sequence: 0,
   updatedAt: Date.now(),
@@ -101,6 +82,8 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   const config = normalizeOptions(options);
   const sessions = new Map();
   const reviews = new Map();
+  const loading = new Map();
+  const turnConfigs = new Map();
   // Shared so one session's failures pause the classifier for all, and not exclusive so sessions do not answer each other `busy`.
   const client = new ClassifierClient({ exclusive: false });
   const controller = new AbortController();
@@ -118,14 +101,23 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     return credential?.key ?? null;
   }
 
-  async function ensure(sessionID) {
-    if (!sessions.has(sessionID)) {
-      const session = await ctx.session.get({ sessionID });
-      const state = initialState(session);
-      state.classifier = { id: config.classifier, label: classifierLabel(config) };
-      sessions.set(sessionID, state);
-    }
-    return sessions.get(sessionID);
+  function ensure(sessionID) {
+    if (sessions.has(sessionID)) return sessions.get(sessionID);
+    // One read per session: a TUI snapshot can race the prompt hook, and each decision must land on the same state.
+    if (!loading.has(sessionID))
+      loading.set(
+        sessionID,
+        ctx.session
+          .get({ sessionID })
+          .then((session) => {
+            const state = initialState(session);
+            state.classifier = { id: config.classifier, label: classifierLabel(config) };
+            sessions.set(sessionID, state);
+            return state;
+          })
+          .finally(() => loading.delete(sessionID)),
+      );
+    return loading.get(sessionID);
   }
 
   async function update(state) {
@@ -134,7 +126,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     await publish(sessionSnapshot(state));
   }
 
-  function sessionSnapshot(state) {
+  function sessionSnapshot({ loop: _loop, ...state }) {
     return {
       ...structuredClone(state),
       activityRouting: config.activityRouting,
@@ -159,15 +151,13 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     return error === 'paused' ? `${status} until ${new Date(client.pausedUntil).toLocaleTimeString()}` : status;
   }
 
-  async function ask(sessionID, prompt, messages, abort = controller.signal) {
-    const state = await ensure(sessionID);
-    const cfg = classifierConfig(config, state.activeModel);
+  async function ask(state, cfg, facts, abort = controller.signal) {
     const credentials = await resolveCredentials(activeClassifier(cfg), async (name) => {
       const env = name.toUpperCase();
       return ctx.options[name] || process.env[env] || (name === 'openrouter_api_key' ? openRouterKey() : null);
     });
     const signal = AbortSignal.any([controller.signal, abort]);
-    const turns = dialogue(messages, prompt, config);
+    const { prompt, turns } = facts;
     const request = async (url, init) => {
       const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(activeClassifier(cfg).timeoutMs + 100)]);
       const response = await fetch(url, { ...init, signal: requestSignal });
@@ -186,75 +176,184 @@ export async function createController(ctx, options = {}, dependencies = {}) {
           config: cfg,
           apiKey: credentials.apiKey,
           endpoint: credentials.endpoint,
-          prompt: clip(prompt, config.context.maxTextChars),
+          prompt,
           turns,
           signal,
         });
     return { advice: result.advice, error: classifierProblem(cfg, result.error) };
   }
 
-  function record(state, origin, decision) {
+  function record(state, origin, decision, ref) {
     state.decisions.unshift({
       at: Date.now(),
       origin,
       classifier: state.classifier.label,
       tier: decision.tier ?? null,
-      confidence: decision.tierConfidence ?? null,
+      confidence: state.tierConfidence,
       activity: decision.activity ?? null,
       reason: decision.reason,
-      model: formatModelRef(decision.nextModel),
+      model: formatModelRef(ref ?? state.nextModel),
     });
     state.decisions.length = Math.min(state.decisions.length, 20);
   }
 
-  async function applyDecision(state, origin, result, pin = null) {
-    const models = await listModels();
-    const decision = decideRoute({
-      config,
-      currentModel: state.activeModel,
-      previousTier: state.tier,
-      pin,
-      advice: result.advice,
-      error: result.error,
-      models,
-      policyState: state.policy,
-      facts: {
-        midTurn: origin === 'review',
-        historyMeasured: state.requests > 0,
-        // shortcut: dwell only, without the Claude adapter's checkpoint test; upgrade when OpenCode tool results are parsed.
-        downAllowed: state.requests - state.switchedAtRequest >= config.policy.minDwellRequests,
-      },
-    });
-    Object.assign(state, decision, { phase: state.mode === 'manual' ? 'manual' : 'routed' });
-    if (pin) state.pendingPin = null;
-    record(state, origin, decision);
-    if (!sameModel(state.activeModel, state.nextModel)) {
-      try {
-        await ctx.session.switchModel({ sessionID: state.sessionID, model: state.nextModel });
-        state.switchedAtRequest = state.requests;
-        state.switches += 1;
-      } catch (error) {
-        state.nextModel = state.activeModel;
-        state.reason = 'model switch failed';
-        state.error = error instanceof Error ? error.message : String(error);
-      }
+  // The config stays frozen for a turn: a route edit reaches the next turn, not a step of this one.
+  async function turnConfig(state) {
+    if (!turnConfigs.has(state.sessionID)) {
+      const catalog = await listModels();
+      turnConfigs.set(state.sessionID, {
+        cfg: routerConfig(config, catalog, state.nativeModel),
+        availableModels: availableModelIds(catalog),
+        nativeModel: modelId(state.nativeModel),
+      });
     }
+    return turnConfigs.get(state.sessionID);
+  }
+
+  // Replies since the last read. Reading stored messages, not step events, keeps usage in step with the transcript; a
+  // session new to this controller counts only its last reply, which is enough to measure the context.
+  function observe(cfg, loop, state, stored) {
+    const replies = stored.filter(
+      (message) => message?.type === 'assistant' && message.tokens && message.time?.completed,
+    );
+    const unseen = state.observedAt
+      ? replies.filter((message) => message.time.completed > state.observedAt)
+      : replies.slice(-1);
+    state.observedAt = replies.at(-1)?.time.completed ?? state.observedAt;
+    return unseen.reduce(
+      (next, message) =>
+        observeResponse(cfg, next, {
+          usage: usageOf(message),
+          requestedModel: modelId(message.model),
+          effort: variantOf(message.model),
+          stopReason: stopReasonOf(message),
+          now: message.time.completed,
+        }),
+      loop,
+    );
+  }
+
+  // What a decision reads now: the frozen config, the transcript, and the usage and facts it gives.
+  async function read(state, { prompt = state.lastPrompt, turnId = state.loop?.turnId, promptImages = false } = {}) {
+    const turn = await turnConfig(state);
+    const stored = await ctx.session.context({ sessionID: state.sessionID });
+    const messages = routerMessages(stored);
+    state.loop = observe(
+      turn.cfg,
+      prepareLoop(state.loop ?? emptyLoop(turn.cfg, turn.nativeModel), messages.length),
+      state,
+      stored,
+    );
+    const last = state.loop.lastRequest;
+    const empty = messages.length === 0;
+    const facts = nativeFacts(turn.cfg, state.loop, {
+      messages,
+      prompt,
+      effort: null,
+      turnId,
+      contextTokens: last ? last.tokens + last.outputTokens : empty ? 0 : null,
+    });
+    if (promptImages) facts.hasImages = true;
+    return { ...turn, facts, empty, contextKnown: Boolean(last) || empty };
+  }
+
+  function showDecision(state, decision, advice) {
+    Object.assign(state, { tier: decision.tier, activity: decision.activity ?? null, reason: decision.reason });
+    if (advice === undefined) return;
+    const activity = advice?.activity;
+    Object.assign(state, {
+      tierConfidence: advice?.confidence ?? null,
+      tierProbability: advice?.probabilities?.[decision.tier] ?? null,
+      activityChoice: activity?.choice ?? null,
+      activityProbability: activity?.probabilities?.[activity.choice] ?? null,
+    });
+  }
+
+  // Applies a selected loop. It is taken first, so a step arriving during the switch sees it, and undone if the host
+  // refuses: the state and the decision row only ever describe a switch that happened.
+  async function commit(state, selected, origin, advice) {
+    const { decision } = selected;
+    const ref = decision.route ? parseModelRef(decision.route.model) : state.nativeModel;
+    const previous = state.loop;
+    state.loop = { ...selected, engineModel: modelId(state.nextModel) };
+    state.phase = state.mode === 'manual' ? 'manual' : 'routed';
+    if (ref && !sameModel(state.nextModel, ref)) {
+      try {
+        await ctx.session.switchModel({ sessionID: state.sessionID, model: ref });
+      } catch (error) {
+        state.loop = previous;
+        state.reason = 'model-unavailable';
+        state.error = error instanceof Error ? error.message : String(error);
+        await update(state);
+        return;
+      }
+      state.nextModel = ref;
+      state.switches += 1;
+    }
+    showDecision(state, decision, advice);
+    if (decision.pinned) state.pendingPin = null;
+    record(state, origin, decision, ref);
     await update(state);
   }
 
-  async function review(state, messages) {
+  const choose = (state, turn, { advice, pin = null, facts = turn.facts }) => {
+    const input = {
+      facts,
+      advice,
+      pin,
+      nativeModel: turn.nativeModel,
+      contextKnown: turn.contextKnown,
+      availableModels: turn.availableModels,
+      now: Date.now(),
+    };
+    if (!turn.empty) return chooseRoute(turn.cfg, state.loop, input);
+    // A session with no history has nothing to overflow, so the unmeasured-shrink hold has nothing to protect. The
+    // one-vote rule for an unmeasured history still applies through the facts.
+    const measured = chooseRoute(turn.cfg, { ...state.loop, historyMeasured: true }, input);
+    return { ...measured, historyMeasured: state.loop.historyMeasured };
+  };
+
+  async function review(state, turn) {
     const abort = new AbortController();
     reviews.set(state.sessionID, abort);
+    const { generation } = state.loop;
+    state.loop = { ...state.loop, reviewedAt: state.loop.requests };
     try {
-      const result = await ask(state.sessionID, state.lastPrompt ?? '', messages, abort.signal);
-      // A failed review is a no-op: the route, the reason and any pin stay as they were.
+      const result = await ask(state, turn.cfg, turn.facts, abort.signal);
+      // A failed review is a no-op, and an answer about a history compaction or a rewind replaced is dropped.
       if (abort.signal.aborted || controller.signal.aborted || state.mode !== 'auto' || !result.advice) return;
-      await applyDecision(state, 'review', result);
+      if (state.loop.generation !== generation) return;
+      // Only the advice is from the review; the checkpoint, context and cache facts are read now.
+      const current = await read(state);
+      if (abort.signal.aborted) return;
+      const facts = { ...current.facts, midTurn: true };
+      await commit(state, choose(state, current, { advice: result.advice, facts }), 'review', result.advice);
     } catch (error) {
       console.error('OpenCode router review failed', error);
     } finally {
       if (reviews.get(state.sessionID) === abort) reviews.delete(state.sessionID);
     }
+  }
+
+  async function routeStep(state, model) {
+    const turn = await read(state);
+    if (isNativeFallback(state.loop, modelId(model))) {
+      state.reason = 'native-fallback';
+      return;
+    }
+    const selected = continueRoute(turn.cfg, state.loop, {
+      hasImages: turn.facts.hasImages,
+      nativeModel: turn.nativeModel,
+      contextTokens: turn.facts.contextTokens,
+      contextKnown: turn.contextKnown,
+      availableModels: turn.availableModels,
+      effort: null,
+    });
+    if (selected.decision !== state.loop.decision) await commit(state, selected, 'step');
+    const { decision, requests, reviewedAt } = state.loop;
+    const every = turn.cfg.policy.reviewEveryRequests;
+    if (every === 0 || !decision.tier || decision.pinned || reviews.has(state.sessionID)) return;
+    if (requests - reviewedAt >= every) void review(state, turn);
   }
 
   return {
@@ -273,7 +372,6 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.phase = mode === 'manual' ? 'manual' : 'ready';
       state.reason = mode === 'manual' ? 'routing off' : 'ready';
       state.error = null;
-      state.nextModel = state.activeModel;
       await update(state);
       return sessionSnapshot(state);
     },
@@ -291,7 +389,6 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       if (!choices.some((choice) => choice.ref === value)) throw new Error(`model is not available: ${value}`);
       config.routeRefs[tier] = ref;
       const state = await ensure(sessionID);
-      state.reason = `${tier} route updated for the next decision`;
       await update(state);
       return sessionSnapshot(state);
     },
@@ -299,7 +396,6 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       if (!['on', 'off'].includes(mode)) throw new Error('activity mode must be "on" or "off"');
       config.activityRouting = mode;
       const state = await ensure(sessionID);
-      state.reason = `activity routing ${mode}`;
       await update(state);
       return sessionSnapshot(state);
     },
@@ -309,9 +405,10 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.generation += 1;
       const generation = state.generation;
       state.lastPrompt = event.prompt.text;
-      state.agent = (await ctx.session.get({ sessionID: event.sessionID })).agent ?? state.agent;
+      const session = await ctx.session.get({ sessionID: event.sessionID });
+      state.agent = session.agent ?? state.agent;
+      state.nextModel = session.model ?? state.nextModel;
       if (state.mode === 'manual' || config.fixedAgents.includes(state.agent)) {
-        state.nextModel = state.activeModel;
         if (state.mode !== 'manual') state.reason = `fixed agent ${state.agent}`;
         await update(state);
         return;
@@ -319,21 +416,25 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.reason = null;
       state.error = null;
       const pin = state.pendingPin;
-      state.pinned = Boolean(pin);
       if (!pin) {
         state.phase = 'choosing';
         await update(state);
       }
       try {
-        const messages = pin ? [] : await ctx.session.context({ sessionID: state.sessionID });
-        const result = pin ? { advice: null, error: null } : await ask(state.sessionID, event.prompt.text, messages);
+        turnConfigs.delete(state.sessionID);
+        const turn = await read(state, {
+          prompt: event.prompt.text,
+          turnId: event.messageID,
+          promptImages: promptHasImages(event.prompt.files),
+        });
+        const result = pin ? { advice: null, error: null } : await ask(state, turn.cfg, turn.facts);
         if (state.generation !== generation || state.mode !== 'auto') return;
-        await applyDecision(state, 'prompt', result, pin);
+        state.error = result.error;
+        await commit(state, choose(state, turn, { advice: result.advice, pin }), 'prompt', result.advice);
       } catch (error) {
         if (state.generation !== generation) return;
         state.phase = 'routed';
-        state.nextModel = state.activeModel;
-        state.reason = 'classifier failed; keeping active model';
+        state.reason = 'no-advice';
         state.error = error instanceof Error ? error.message : String(error);
         await update(state);
       }
@@ -344,13 +445,9 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.activeModel = event.model;
       if (!state.nextModel) state.nextModel = event.model;
       if (state.mode !== 'manual') state.phase = 'routed';
-      state.requests += 1;
+      const routed = state.mode === 'auto' && !state.parentID && !config.fixedAgents.includes(event.agent);
+      if (routed && state.loop?.decision) await routeStep(state, event.model);
       await update(state);
-      const every = config.policy.reviewEveryRequests;
-      const routed =
-        state.mode === 'auto' && !state.pinned && !state.parentID && !config.fixedAgents.includes(event.agent);
-      if (routed && every > 0 && state.requests % every === 0 && !reviews.has(state.sessionID))
-        void review(state, event.messages);
     }),
     idle: failOpen(async (sessionID) => {
       cancelReview(sessionID);
@@ -363,10 +460,12 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     remove(sessionID) {
       cancelReview(sessionID);
       sessions.delete(sessionID);
+      turnConfigs.delete(sessionID);
     },
     close() {
       controller.abort();
       sessions.clear();
+      turnConfigs.clear();
     },
   };
 }

@@ -1,13 +1,40 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { TIERS } from '../lib/config.mjs';
+import { chooseRoute, emptyLoop, nativeFacts } from '../lib/route.mjs';
+import { availableModelIds, formatModelRef, modelId, normalizeOptions, routerConfig } from '../opencode/config.mjs';
 import { createController } from '../opencode/controller.mjs';
 
 const kimi = { providerID: 'openrouter', id: 'moonshotai/kimi-k3.1-pro', variant: 'high' };
 const openai = { providerID: 'openai', id: 'gpt-6.1-sol', variant: 'high' };
+const tiny = { providerID: 'openrouter', id: 'cheap/tiny' };
+const priced = (input, output, context) => ({
+  cost: [{ input, output, cache: { read: input / 10, write: input * 1.25 } }],
+  limit: { context, output: 8000 },
+  capabilities: { input: ['text', 'image'] },
+});
 const models = [
-  { providerID: kimi.providerID, id: kimi.id, name: 'Kimi', variants: [{ id: 'high' }, { id: 'max' }] },
-  { providerID: openai.providerID, id: openai.id, name: 'GPT', variants: [{ id: 'high' }] },
+  {
+    providerID: kimi.providerID,
+    id: kimi.id,
+    name: 'Kimi',
+    variants: [{ id: 'high' }, { id: 'max' }],
+    ...priced(1, 4, 1_000_000),
+  },
+  {
+    providerID: openai.providerID,
+    id: openai.id,
+    name: 'GPT',
+    variants: [{ id: 'high' }],
+    ...priced(5, 25, 1_000_000),
+  },
+  { providerID: tiny.providerID, id: tiny.id, name: 'Tiny', variants: [], ...priced(0.1, 0.4, 100_000) },
 ];
+const fullAdvice = (advice) =>
+  advice && {
+    ...advice,
+    probabilities: { ...Object.fromEntries(TIERS.map((tier) => [tier, 0])), ...advice.probabilities },
+  };
 
 async function harness(
   initialAdvice,
@@ -15,38 +42,70 @@ async function harness(
   fixedAgents = [],
   sessionFields = {},
   dependencies = null,
+  activities = {},
 ) {
   const switches = [];
   const published = [];
-  const current = { advice: initialAdvice, asks: 0, answer: null };
+  const current = { advice: initialAdvice, asks: 0, answer: null, clock: 1000 };
   const calls = [];
+  const stored = [];
+  const selected = { model: Object.hasOwn(sessionFields, 'model') ? sessionFields.model : kimi };
   const ctx = {
     options: {},
     session: {
-      get: async ({ sessionID }) => ({ id: sessionID, model: kimi, agent: 'build', ...sessionFields }),
-      context: async () => [],
-      switchModel: async (input) => switches.push(input),
+      get: async ({ sessionID }) => ({ id: sessionID, agent: 'build', ...sessionFields, model: selected.model }),
+      context: async () => stored,
+      switchModel: async (input) => {
+        switches.push(input);
+        selected.model = input.model;
+      },
     },
     model: { list: async () => ({ data: models }) },
   };
   const controller = await createController(
     ctx,
-    { classifier: 'ollama', routes, fixedAgents },
+    { classifier: 'ollama', routes, activities, fixedAgents },
     dependencies ?? {
       ask: async (input) => {
         current.asks += 1;
         calls.push(input);
-        return current.answer ? current.answer(input) : { advice: current.advice, error: null };
+        if (current.answer) return current.answer(input);
+        return { advice: fullAdvice(current.advice), error: null };
       },
     },
   );
   controller.setPublisher(async (state) => published.push(state));
+  // One provider request that finished: the stored reply lib/route.mjs measures.
+  const reply = (fields = {}) => {
+    current.clock += 1;
+    stored.push({
+      type: 'assistant',
+      model: selected.model,
+      content: [{ type: 'text', text: 'Done' }],
+      tokens: { input: 2, output: 10, reasoning: 0, cache: { read: 1000, write: 10 } },
+      finish: 'stop',
+      time: { created: current.clock, completed: current.clock },
+      ...fields,
+    });
+  };
+  // The next provider request starts, then finishes.
+  const step = async (model = selected.model, agent = 'build') => {
+    await controller.context({ sessionID: 'ses_test', agent, model, messages: [] });
+    await settle();
+    reply();
+  };
   return {
     ctx,
     controller,
     switches,
     published,
     calls,
+    stored,
+    reply,
+    step,
+    steps: async (count) => {
+      for (let request = 0; request < count; request += 1) await step();
+    },
     asks: () => current.asks,
     setAnswer: (answer) => {
       current.answer = answer;
@@ -57,6 +116,21 @@ async function harness(
   };
 }
 
+const settle = async () => {
+  for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+const quietConsole = (t) => t.mock.method(console, 'error', () => {});
+const send = (controller, text = 'Work', sessionID = 'ses_test', extra = {}) =>
+  controller.prompt({ sessionID, prompt: { text }, ...extra });
+const highAdvice = { choice: 'high', confidence: 0.9, probabilities: { high: 0.9 } };
+const lowAdvice = { choice: 'low', confidence: 0.9, probabilities: { low: 0.9 } };
+const planAdvice = (activityMass) => ({
+  choice: 'uncertain',
+  confidence: 0.2,
+  probabilities: { low: 0.3, medium: 0.3, high: 0.2 },
+  activity: { choice: 'plan', probabilities: { plan: activityMass } },
+});
+
 test('prompt routing switches to the selected provider and records visible advice', async () => {
   const { controller, switches, published } = await harness({
     choice: 'high',
@@ -64,7 +138,7 @@ test('prompt routing switches to the selected provider and records visible advic
     probabilities: { high: 0.93 },
     activity: { choice: 'debug', probabilities: { debug: 0.81 } },
   });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Find the race condition' } });
+  await send(controller, 'Find the race condition');
   const state = await controller.snapshot('ses_test');
   assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
   assert.equal(state.tier, 'high');
@@ -75,25 +149,24 @@ test('prompt routing switches to the selected provider and records visible advic
   assert.deepEqual(state.activeModel, kimi);
   assert.deepEqual(state.nextModel, openai);
   assert.equal(published.at(-1).decisions[0].origin, 'prompt');
+  assert.equal(published.at(-1).loop, undefined);
   controller.close();
 });
 
 test('the context hook reveals the model serving active work', async () => {
-  const { controller } = await harness({ choice: 'high', confidence: 0.8, probabilities: { high: 0.8 } });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-  await controller.context({ sessionID: 'ses_test', agent: 'build', model: openai, messages: [] });
+  const { controller, step } = await harness(highAdvice);
+  await send(controller);
+  await step(openai);
   const state = await controller.snapshot('ses_test');
   assert.deepEqual(state.activeModel, openai);
   assert.deepEqual(state.nextModel, openai);
-  assert.equal(state.requests, 1);
   controller.close();
 });
 
 test('manual mode never asks the classifier or switches the model', async () => {
-  const advice = { choice: 'high', confidence: 1, probabilities: { high: 1 } };
-  const { controller, switches, published } = await harness(advice);
+  const { controller, switches, published } = await harness(highAdvice);
   await controller.setMode('ses_test', 'manual');
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await send(controller);
   assert.equal(
     published.some((state) => state.phase === 'choosing'),
     false,
@@ -107,7 +180,7 @@ test('route controls accept an available model from any provider and reject unkn
   const { controller, asks } = await harness(null);
   await controller.setRoute('ses_test', 'medium', 'openrouter/moonshotai/kimi-k3.1-pro#max');
   await controller.setPin('ses_test', 'medium');
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Review this' } });
+  await send(controller, 'Review this');
   const state = await controller.snapshot('ses_test');
   assert.equal(state.nextModel.variant, 'max');
   assert.equal(state.reason, 'pinned');
@@ -116,81 +189,76 @@ test('route controls accept an available model from any provider and reject unkn
   controller.close();
 });
 
-test('reviews need two votes and the dwell before a downgrade reaches the next turn', async () => {
-  const { controller, switches, setAdvice } = await harness(
-    { choice: 'high', confidence: 0.9, probabilities: { high: 0.9 } },
-    {
-      high: 'openai/gpt-6.1-sol#high',
-      low: 'openrouter/moonshotai/kimi-k3.1-pro#high',
-    },
-  );
-  const turns = async (count) => {
-    for (let request = 0; request < count; request += 1) {
-      await controller.context({ sessionID: 'ses_test', agent: 'build', model: openai, messages: [] });
-      for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
-    }
-  };
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Start difficult work' } });
-  setAdvice({ choice: 'low', confidence: 0.9, probabilities: { low: 0.9, high: 0.1 } });
-  await turns(4);
-  assert.equal(switches.length, 1);
-  assert.equal((await controller.snapshot('ses_test')).reason, 'downgrade-pending');
-  await turns(4);
+test('a review applies a stronger route to the next step of the running turn', async () => {
+  const { controller, switches, setAdvice, steps } = await harness(lowAdvice, {
+    low: 'openrouter/moonshotai/kimi-k3.1-pro#high',
+    high: 'openai/gpt-6.1-sol#high',
+  });
+  await send(controller);
+  setAdvice({ choice: 'high', confidence: 0.98, probabilities: { high: 0.98, low: 0.02 } });
+  await steps(9);
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
   const state = await controller.snapshot('ses_test');
-  assert.equal(switches.length, 2);
-  assert.deepEqual(switches[1].model, kimi);
-  assert.deepEqual(state.activeModel, openai);
-  assert.deepEqual(state.nextModel, kimi);
   assert.equal(state.decisions[0].origin, 'review');
+  assert.equal(state.tier, 'high');
+  controller.close();
+});
+
+test('reviews wait for four requests since the last answer, however the count is reached', async () => {
+  const { controller, asks, steps, reply } = await harness(lowAdvice);
+  await send(controller);
+  assert.equal(asks(), 1);
+  await steps(4);
+  assert.equal(asks(), 1);
+  // Three requests landed between hooks, so the count skips past a multiple of four.
+  reply();
+  reply();
+  await steps(1);
+  assert.equal(asks(), 2);
   controller.close();
 });
 
 test('one noisy prompt does not move the model until a second vote agrees', async () => {
-  const { controller, switches, setAdvice } = await harness(
-    { choice: 'low', confidence: 0.9, probabilities: { low: 0.9 } },
-    {
-      low: 'openrouter/moonshotai/kimi-k3.1-pro#high',
-      high: 'openai/gpt-6.1-sol#high',
-    },
-  );
-  const prompt = async () => {
-    await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-    await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
-  };
-  await prompt();
+  const { controller, switches, setAdvice, step } = await harness(lowAdvice, {
+    low: 'openrouter/moonshotai/kimi-k3.1-pro#high',
+    high: 'openai/gpt-6.1-sol#high',
+  });
+  await send(controller);
+  await step();
   setAdvice({ choice: 'high', confidence: 0.8, probabilities: { high: 0.8, low: 0.2 } });
-  await prompt();
+  await send(controller);
+  await step();
   assert.equal(switches.length, 0);
   assert.equal((await controller.snapshot('ses_test')).reason, 'upgrade-pending');
-  await prompt();
+  await send(controller);
   assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
   assert.equal((await controller.snapshot('ses_test')).reason, 'upgrade');
   controller.close();
 });
 
 test('a confident two-tier jump moves on a single vote', async () => {
-  const { controller, switches, setAdvice } = await harness(
+  const { controller, switches, setAdvice, step } = await harness(
     { choice: 'micro', confidence: 0.9, probabilities: { micro: 0.9 } },
     {
       micro: 'openrouter/moonshotai/kimi-k3.1-pro#high',
       high: 'openai/gpt-6.1-sol#high',
     },
   );
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Hi' } });
-  await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
+  await send(controller, 'Hi');
+  await step();
   setAdvice({ choice: 'high', confidence: 0.99, probabilities: { high: 0.99, micro: 0.01 } });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Redesign it all' } });
+  await send(controller, 'Redesign it all');
   assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
   assert.equal((await controller.snapshot('ses_test')).reason, 'jump');
   controller.close();
 });
 
 test('a fixed agent keeps its own model and never asks the classifier', async () => {
-  const { controller, switches, asks } = await harness({ choice: 'high', confidence: 1, probabilities: { high: 1 } });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Plan' } });
+  const { controller, switches, asks } = await harness(highAdvice);
+  await send(controller, 'Plan');
   assert.equal(asks(), 1);
-  const fixed = await harness({ choice: 'high', confidence: 1, probabilities: { high: 1 } }, undefined, ['build']);
-  await fixed.controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Plan' } });
+  const fixed = await harness(highAdvice, undefined, ['build']);
+  await send(fixed.controller, 'Plan');
   assert.equal(fixed.asks(), 0);
   assert.equal(fixed.switches.length, 0);
   assert.equal((await fixed.controller.snapshot('ses_test')).reason, 'fixed agent build');
@@ -233,51 +301,40 @@ test('Jev through OpenRouter posts System One with the stored OpenRouter key', a
   controller.close();
 });
 
-const highAdvice = { choice: 'high', confidence: 0.9, probabilities: { high: 0.9 } };
-
 test('the switch count rises only when the model really changed', async () => {
-  const { controller, published } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, published, step } = await harness(highAdvice);
+  await send(controller);
   assert.equal(published.at(-1).switches, 1);
-  await controller.context({ sessionID: 'ses_test', agent: 'build', model: openai, messages: [] });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'More work' } });
+  await step();
+  await send(controller, 'More work');
   assert.equal(published.at(-1).switches, 1);
   controller.close();
 });
 
-test('a failed model switch is not counted', async () => {
+test('a failed model switch changes no route, row or count', async () => {
   const { controller, ctx, published } = await harness(highAdvice);
   ctx.session.switchModel = async () => {
     throw new Error('rejected');
   };
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-  assert.equal(published.at(-1).switches, 0);
-  assert.equal(published.at(-1).reason, 'model switch failed');
+  await send(controller);
+  const state = published.at(-1);
+  assert.equal(state.switches, 0);
+  assert.equal(state.reason, 'model-unavailable');
+  assert.equal(state.error, 'rejected');
+  assert.equal(state.tier, null);
+  assert.equal(state.decisions.length, 0);
+  assert.deepEqual(state.nextModel, kimi);
   controller.close();
 });
 
-const step = (controller, model = kimi, messages = []) =>
-  controller.context({ sessionID: 'ses_test', agent: 'build', model, messages });
-const settle = async () => {
-  for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
-};
-const steps = async (controller, count) => {
-  for (let request = 0; request < count; request += 1) {
-    await step(controller);
-    await settle();
-  }
-};
-const quietConsole = (t) => t.mock.method(console, 'error', () => {});
-
-test('the classifier reads dialogue from stored session messages', async () => {
-  const { controller, ctx, calls } = await harness(highAdvice);
-  ctx.session.context = async () => [
-    { type: 'user', text: 'Earlier question' },
-    { type: 'model-switched', model: kimi },
-    { type: 'assistant', content: [{ type: 'text', text: 'Earlier answer' }, { type: 'tool' }] },
-    { type: 'idle', outcome: 'succeeded' },
-  ];
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+test('the classifier reads the dialogue in stored session messages', async () => {
+  const { controller, stored, calls, reply } = await harness(highAdvice);
+  stored.push({ type: 'user', text: '<system-reminder>noise</system-reminder>Earlier question' });
+  stored.push({ type: 'model-switched', model: kimi });
+  reply({ content: [{ type: 'text', text: 'Earlier answer' }, { type: 'tool' }] });
+  stored.push({ type: 'idle', outcome: 'succeeded' });
+  await send(controller);
+  assert.equal(calls[0].prompt, 'Work');
   assert.deepEqual(calls[0].turns, [
     { role: 'user', text: 'Earlier question' },
     { role: 'assistant', text: 'Earlier answer' },
@@ -285,59 +342,48 @@ test('the classifier reads dialogue from stored session messages', async () => {
   controller.close();
 });
 
-test('the classifier reads dialogue from provider messages during a review', async () => {
+test('a long prompt is clipped to the limit', async () => {
   const { controller, calls } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-  const messages = [
-    { role: 'system', content: [{ type: 'text', text: 'Instructions' }] },
-    { role: 'user', content: [{ type: 'text', text: 'Earlier question' }] },
-    { role: 'assistant', content: [{ type: 'text', text: 'Earlier answer' }] },
-    { role: 'tool', content: [{ type: 'tool-result' }] },
-  ];
-  for (let request = 0; request < 4; request += 1) await step(controller, openai, messages);
-  await settle();
-  assert.deepEqual(calls.at(-1).turns, [
-    { role: 'user', text: 'Earlier question' },
-    { role: 'assistant', text: 'Earlier answer' },
-  ]);
+  await send(controller, 'x'.repeat(1_000_000));
+  assert.ok(calls[0].prompt.length <= normalizeOptions().context.maxTextChars);
   controller.close();
 });
 
 test('a prompt during a review cancels it, and later reviews still run', async () => {
-  const { controller, calls, setAnswer } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, calls, setAnswer, steps } = await harness(highAdvice);
+  await send(controller);
   setAnswer(() => new Promise(() => {}));
-  await steps(controller, 4);
+  await steps(5);
   assert.equal(calls.length, 2);
   const inFlight = calls[1];
   assert.equal(inFlight.signal.aborted, false);
   setAnswer(null);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Next' } });
+  await send(controller, 'Next');
   assert.equal(inFlight.signal.aborted, true);
-  await steps(controller, 4);
+  await steps(5);
   assert.equal(calls.length, 4);
   controller.close();
 });
 
 test('a review is cancelled when the turn ends', async () => {
-  const { controller, calls, setAnswer } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, calls, setAnswer, steps } = await harness(highAdvice);
+  await send(controller);
   setAnswer(() => new Promise(() => {}));
-  await steps(controller, 4);
+  await steps(5);
   await controller.idle('ses_test');
   assert.equal(calls[1].signal.aborted, true);
   controller.close();
 });
 
 test('a failed review changes nothing, including a pin set while it ran', async () => {
-  const { controller, setAnswer, published } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, setAnswer, published, steps } = await harness(highAdvice);
+  await send(controller);
   const before = await controller.snapshot('ses_test');
   setAnswer(async () => {
     await controller.setPin('ses_test', 'low');
     return { advice: null, error: 'timeout' };
   });
-  await steps(controller, 4);
+  await steps(5);
   const after = await controller.snapshot('ses_test');
   assert.equal(after.pendingPin, 'low');
   assert.equal(after.reason, before.reason);
@@ -349,13 +395,13 @@ test('a failed review changes nothing, including a pin set while it ran', async 
 
 test('a review that throws changes nothing', async (t) => {
   const log = quietConsole(t);
-  const { controller, setAnswer } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, setAnswer, steps } = await harness(highAdvice);
+  await send(controller);
   const before = await controller.snapshot('ses_test');
   setAnswer(async () => {
     throw new Error('boom');
   });
-  await steps(controller, 4);
+  await steps(5);
   const after = await controller.snapshot('ses_test');
   assert.equal(after.reason, before.reason);
   assert.equal(after.error, null);
@@ -364,34 +410,49 @@ test('a review that throws changes nothing', async (t) => {
 });
 
 test('a successful review keeps a pin set while it ran', async () => {
-  const { controller, setAnswer } = await harness(highAdvice);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, setAnswer, steps } = await harness(highAdvice);
+  await send(controller);
   setAnswer(async () => {
     await controller.setPin('ses_test', 'low');
-    return { advice: highAdvice, error: null };
+    return { advice: fullAdvice(highAdvice), error: null };
   });
-  await steps(controller, 4);
+  await steps(5);
   assert.equal((await controller.snapshot('ses_test')).pendingPin, 'low');
   controller.close();
 });
 
 test('a pinned turn is not reviewed, and the next turn is', async () => {
-  const { controller, asks } = await harness(highAdvice);
+  const { controller, asks, steps } = await harness(highAdvice);
   await controller.setPin('ses_test', 'high');
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-  await steps(controller, 8);
+  await send(controller);
+  await steps(9);
   assert.equal(asks(), 0);
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'More' } });
-  await steps(controller, 4);
+  await send(controller, 'More');
+  await steps(5);
   assert.equal(asks(), 2);
   controller.close();
 });
 
+test('a pin does not become the incumbent for the next turn', async () => {
+  const routes = { low: 'openrouter/moonshotai/kimi-k3.1-pro#high', high: 'openai/gpt-6.1-sol#high' };
+  const { controller, switches, step } = await harness(lowAdvice, routes);
+  await send(controller);
+  await step();
+  await controller.setPin('ses_test', 'high');
+  await send(controller, 'Pinned');
+  assert.deepEqual(switches.at(-1).model, openai);
+  await step();
+  await send(controller, 'Back');
+  assert.deepEqual(switches.at(-1).model, kimi);
+  assert.equal((await controller.snapshot('ses_test')).tier, 'low');
+  controller.close();
+});
+
 test('a subagent session is never reviewed during its run', async () => {
-  const { controller, asks } = await harness(highAdvice, undefined, [], { parentID: 'ses_parent' });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  const { controller, asks, steps } = await harness(highAdvice, undefined, [], { parentID: 'ses_parent' });
+  await send(controller);
   const atSpawn = asks();
-  await steps(controller, 8);
+  await steps(9);
   assert.equal(asks(), atSpawn);
   controller.close();
 });
@@ -400,43 +461,46 @@ test('a session without a model and with partial routes still reaches the classi
   const { controller, asks, switches } = await harness(highAdvice, { high: 'openai/gpt-6.1-sol#high' }, [], {
     model: undefined,
   });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await send(controller);
   assert.equal(asks(), 1);
   assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
   controller.close();
 });
 
-test('a tier that resolves to no model keeps the session model', async () => {
-  const advice = { choice: 'low', confidence: 0.9, probabilities: { low: 0.9 } };
-  const { controller, switches } = await harness(advice, { high: 'openai/gpt-6.1-sol#high' }, [], { model: undefined });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-  const state = await controller.snapshot('ses_test');
-  assert.equal(switches.length, 0);
-  assert.equal(state.nextModel ?? null, null);
-  assert.equal(state.reason, 'model unavailable');
-  controller.close();
+test('a tier without a route runs the session model, and with no session model it falls back', async () => {
+  const native = await harness(lowAdvice);
+  await send(native.controller);
+  assert.equal(native.switches.length, 0);
+  assert.equal((await native.controller.snapshot('ses_test')).tier, 'low');
+  native.controller.close();
+  const unset = await harness(lowAdvice, {}, [], { model: undefined });
+  await send(unset.controller);
+  assert.equal(unset.switches.length, 0);
+  assert.equal((await unset.controller.snapshot('ses_test')).reason, 'model-unavailable');
+  unset.controller.close();
 });
 
 test('routine classifier states stay silent and real failures use the display wording', async () => {
   const { controller, setAnswer } = await harness(highAdvice);
   for (const error of ['busy', 'cancelled']) {
     setAnswer(() => ({ advice: null, error }));
-    await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+    await send(controller);
     assert.equal((await controller.snapshot('ses_test')).error, null, error);
   }
   setAnswer(() => ({ advice: null, error: 'timeout' }));
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
-  assert.equal((await controller.snapshot('ses_test')).error, 'Ollama timed out');
+  await send(controller);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.error, 'Ollama timed out');
+  assert.equal(state.reason, 'no-advice');
   controller.close();
 });
 
 test('the failure breaker is shared across sessions and names when it reopens', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('nope', { status: 400 }));
   const { controller } = await harness(highAdvice, undefined, [], {}, {});
-  for (let failure = 0; failure < 3; failure += 1)
-    await controller.prompt({ sessionID: 'ses_first', prompt: { text: 'Work' } });
+  for (let failure = 0; failure < 3; failure += 1) await send(controller, 'Work', 'ses_first');
   const sent = fetch.mock.callCount();
-  await controller.prompt({ sessionID: 'ses_second', prompt: { text: 'Work' } });
+  await send(controller, 'Work', 'ses_second');
   assert.equal(fetch.mock.callCount(), sent);
   assert.match((await controller.snapshot('ses_second')).error, /^Ollama paused after failures until .+\d/);
   controller.close();
@@ -448,7 +512,7 @@ test('a host failure never rejects a hook, which would lose the prompt, or ends 
   ctx.session.get = async () => {
     throw new Error('host down');
   };
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await send(controller);
   await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
   await controller.idle('ses_test');
   assert.equal(log.mock.callCount(), 3);
@@ -461,7 +525,156 @@ test('a failed publish does not reject a hook', async (t) => {
   controller.setPublisher(async () => {
     throw new Error('rpc closed');
   });
-  await controller.prompt({ sessionID: 'ses_test', prompt: { text: 'Work' } });
+  await send(controller);
   await controller.context({ sessionID: 'ses_test', agent: 'build', model: kimi, messages: [] });
   controller.close();
+});
+
+test('a snapshot racing the first prompt shares its state', async () => {
+  const { controller } = await harness(highAdvice);
+  const [, state] = await Promise.all([send(controller), controller.snapshot('ses_test')]);
+  assert.equal(state.sessionID, 'ses_test');
+  assert.equal((await controller.snapshot('ses_test')).tier, 'high');
+  controller.close();
+});
+
+const planRoutes = { low: 'openrouter/moonshotai/kimi-k3.1-pro#high', high: 'openai/gpt-6.1-sol#high' };
+const planActivities = { plan: { low: 'openai/gpt-6.1-sol#high' } };
+
+test('a confident activity routes an uncertain tier, as chooseRoute does', async () => {
+  const { controller, switches } = await harness(planAdvice(0.95), planRoutes, [], {}, null, planActivities);
+  await send(controller);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.activity, 'plan');
+  assert.equal(state.reason, 'activity-up');
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
+  controller.close();
+});
+
+test('an activity below the bar keeps the base route', async () => {
+  const { controller, switches } = await harness(planAdvice(0.4), planRoutes, [], {}, null, planActivities);
+  await send(controller);
+  assert.equal(switches.length, 0);
+  assert.equal((await controller.snapshot('ses_test')).activity, null);
+  controller.close();
+});
+
+test('a route edit is gated: a cheaper route on the same task waits for its checkpoint', async () => {
+  const routes = { low: 'openai/gpt-6.1-sol#high' };
+  const advice = { ...lowAdvice, continuation: 0.9 };
+  const { controller, switches, step } = await harness(advice, routes, [], { model: openai });
+  await send(controller);
+  await step();
+  await controller.setRoute('ses_test', 'low', 'openrouter/moonshotai/kimi-k3.1-pro#high');
+  await send(controller, 'Same task');
+  assert.equal(switches.length, 0);
+  assert.equal((await controller.snapshot('ses_test')).reason, 'downgrade-held');
+  controller.close();
+});
+
+test('a session too full for a route stays on the larger window with context-fit', async () => {
+  const routes = { low: 'openrouter/cheap/tiny', high: 'openrouter/moonshotai/kimi-k3.1-pro#high' };
+  const { controller, switches, reply } = await harness(lowAdvice, routes);
+  reply({ tokens: { input: 2, output: 500, reasoning: 0, cache: { read: 300_000, write: 0 } } });
+  await send(controller);
+  await send(controller, 'Second vote');
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.reason, 'context-fit');
+  assert.notEqual(state.tier, 'low');
+  assert.equal(switches.length, 0);
+  controller.close();
+});
+
+test('growth during a turn moves it off a window it no longer fits', async () => {
+  const routes = { low: 'openrouter/cheap/tiny', high: 'openrouter/moonshotai/kimi-k3.1-pro#high' };
+  const { controller, switches, reply, step } = await harness(lowAdvice, routes, [], { model: tiny });
+  await send(controller);
+  reply({ tokens: { input: 2, output: 500, reasoning: 0, cache: { read: 300_000, write: 0 } } });
+  await step();
+  assert.deepEqual(switches, [{ sessionID: 'ses_test', model: kimi }]);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.reason, 'context-fit');
+  assert.equal(state.decisions[0].origin, 'step');
+  controller.close();
+});
+
+test('an unmeasured history holds a smaller window, and a new session does not', async () => {
+  const routes = { low: 'openrouter/cheap/tiny', high: 'openrouter/moonshotai/kimi-k3.1-pro#high' };
+  const fresh = await harness(lowAdvice, routes);
+  await send(fresh.controller);
+  assert.deepEqual(fresh.switches, [{ sessionID: 'ses_test', model: tiny }]);
+  fresh.controller.close();
+  const resumed = await harness(lowAdvice, routes);
+  resumed.stored.push({ type: 'user', text: 'History with no measured reply' });
+  await send(resumed.controller);
+  assert.equal(resumed.switches.length, 0);
+  assert.equal((await resumed.controller.snapshot('ses_test')).reason, 'context-unknown');
+  resumed.controller.close();
+});
+
+test('an image skips a route that cannot read it', async () => {
+  const blind = { providerID: 'openrouter', id: 'cheap/blind' };
+  const { controller, ctx, switches } = await harness(lowAdvice, { low: 'openrouter/cheap/blind' });
+  ctx.model.list = async () => ({
+    data: [
+      ...models,
+      { ...blind, name: 'Blind', variants: [], ...priced(0.1, 0.4, 1_000_000), capabilities: { input: ['text'] } },
+    ],
+  });
+  await send(controller, 'What is this?', 'ses_test', { messageID: 'msg_1' });
+  assert.deepEqual(switches.at(-1)?.model, blind);
+  await controller.remove('ses_test');
+  switches.length = 0;
+  ctx.session.get = async ({ sessionID }) => ({ id: sessionID, model: kimi, agent: 'build' });
+  await controller.prompt({
+    sessionID: 'ses_test',
+    prompt: { text: 'And this?', files: [{ uri: 'file:///tmp/shot.png' }] },
+  });
+  assert.equal(switches.length, 0);
+  assert.equal((await controller.snapshot('ses_test')).reason, 'model-unavailable');
+  controller.close();
+});
+
+test('a third model mid-turn suspends routing for the turn', async () => {
+  const { controller, switches, step, setAdvice } = await harness(lowAdvice);
+  await send(controller);
+  setAdvice(highAdvice);
+  await step(tiny);
+  assert.equal((await controller.snapshot('ses_test')).reason, 'native-fallback');
+  assert.equal(switches.length, 0);
+  controller.close();
+});
+
+test('the controller decides as chooseRoute does for the same scenario', async () => {
+  const config = normalizeOptions({ classifier: 'ollama', routes: planRoutes, activities: planActivities });
+  const cfg = routerConfig(config, models, kimi);
+  const input = (advice) => ({
+    facts: nativeFacts(cfg, emptyLoop(cfg, modelId(kimi)), {
+      messages: [],
+      prompt: 'Work',
+      effort: null,
+      contextTokens: 0,
+    }),
+    advice,
+    pin: null,
+    nativeModel: modelId(kimi),
+    contextKnown: true,
+    availableModels: availableModelIds(models),
+    now: Date.now(),
+  });
+  for (const advice of [highAdvice, lowAdvice, planAdvice(0.95), planAdvice(0.4)]) {
+    const direct = chooseRoute(
+      cfg,
+      { ...emptyLoop(cfg, modelId(kimi)), historyMeasured: true },
+      input(fullAdvice(advice)),
+    );
+    const { controller } = await harness(advice, planRoutes, [], {}, null, planActivities);
+    await send(controller);
+    const state = await controller.snapshot('ses_test');
+    assert.equal(state.tier, direct.decision.tier, JSON.stringify(advice));
+    assert.equal(state.activity, direct.decision.activity, JSON.stringify(advice));
+    assert.equal(state.reason, direct.decision.reason, JSON.stringify(advice));
+    assert.equal(formatModelRef(state.nextModel), direct.decision.route.model, JSON.stringify(advice));
+    controller.close();
+  }
 });

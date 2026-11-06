@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  decideRoute,
+  availableModelIds,
   formatModelRef,
   modelOptions,
   normalizeOptions,
   parseModelRef,
+  routerConfig,
   sameModel,
 } from '../opencode/config.mjs';
+import { promptHasImages, routerMessages, stopReasonOf, usageOf } from '../opencode/messages.mjs';
 
 const kimi = 'openrouter/moonshotai/kimi-k3.1-pro#high';
 const current = parseModelRef(kimi);
+const kimiRef = current;
 
 test('OpenCode model refs retain the provider, slashes, and variant', () => {
   assert.deepEqual(parseModelRef(kimi), {
@@ -45,49 +48,113 @@ test('model choices include every available provider and every model variant', (
   );
 });
 
-test('a classifier decision can select any configured provider and applies activity routes', () => {
+test('the router config maps every ref to an alias with catalog limits and prices', () => {
+  const opus = parseModelRef('openrouter/anthropic/claude-opus-5.5#high');
   const config = normalizeOptions({
-    routes: { medium: 'openai/gpt-6.1-sol#high', high: kimi },
-    activities: { review: { medium: 'openrouter/moonshotai/kimi-k3.1-pro#max' } },
+    routes: { high: 'openrouter/anthropic/claude-opus-5.5#medium', low: 'ollama/qwen3:8b' },
+    activities: { plan: { low: 'openrouter/anthropic/claude-opus-5.5#high' } },
   });
-  const decision = decideRoute({
-    config,
-    currentModel: current,
-    advice: {
-      choice: 'medium',
-      confidence: 0.87,
-      probabilities: { medium: 0.91 },
-      activity: { choice: 'review', probabilities: { review: 0.76 } },
+  const catalog = [
+    {
+      providerID: 'openrouter',
+      id: 'anthropic/claude-opus-5.5',
+      variants: [{ id: 'medium' }, { id: 'high' }],
+      limit: { context: 200_000, output: 32_000 },
+      capabilities: { input: ['text', 'image'] },
+      cost: [
+        { tier: { type: 'context', size: 100_000 }, input: 10, output: 50, cache: { read: 1, write: 12.5 } },
+        { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
+      ],
     },
-    models: [
-      { providerID: 'openai', id: 'gpt-6.1-sol', variants: [{ id: 'high' }] },
-      { providerID: 'openrouter', id: 'moonshotai/kimi-k3.1-pro', variants: [{ id: 'max' }] },
-    ],
-  });
-  assert.equal(formatModelRef(decision.nextModel), 'openrouter/moonshotai/kimi-k3.1-pro#max');
-  assert.equal(decision.tier, 'medium');
-  assert.equal(decision.tierConfidence, 0.87);
-  assert.equal(decision.tierProbability, 0.91);
-  assert.equal(decision.activity, 'review');
-  assert.equal(decision.activityProbability, 0.76);
-  assert.equal(decision.reason, 'activity override (same-tier)');
+    {
+      providerID: 'ollama',
+      id: 'qwen3:8b',
+      variants: [],
+      limit: { context: 32_000 },
+      capabilities: { input: ['text'] },
+      cost: [],
+    },
+  ];
+  const cfg = routerConfig(config, catalog, current);
+  assert.deepEqual(cfg.routes.high, { model: 'openrouter/anthropic/claude-opus-5.5#medium', effort: null });
+  assert.deepEqual(cfg.activities.plan.low, { model: formatModelRef(opus), effort: null });
+  const medium = cfg.models['openrouter/anthropic/claude-opus-5.5#medium'];
+  const high = cfg.models['openrouter/anthropic/claude-opus-5.5#high'];
+  assert.equal(medium.id, 'openrouter/anthropic/claude-opus-5.5');
+  assert.equal(high.id, medium.id);
+  assert.equal(medium.contextWindow, 200_000);
+  assert.equal(medium.billing, 'credits');
+  assert.deepEqual(medium.longContext, { above: 100_000, multiplier: 2 });
+  assert.equal(medium.imageInput, true);
+  assert.deepEqual(medium.efforts, []);
+  assert.ok(high.strength > medium.strength);
+  const local = cfg.models['ollama/qwen3:8b'];
+  assert.equal(local.billing, 'plan');
+  assert.equal(local.imageInput, false);
+  assert.equal(local.longContext, undefined);
 });
 
-test('an unavailable route or missing advice keeps the current model', () => {
-  const config = normalizeOptions({ routes: { high: 'openai/not-connected#high' } });
-  const unavailable = decideRoute({
-    config,
-    currentModel: current,
-    advice: { choice: 'high', confidence: 0.9, probabilities: { high: 0.9 } },
-    models: [],
-  });
-  assert.deepEqual(unavailable.nextModel, current);
-  assert.equal(unavailable.reason, 'model unavailable');
+test('a tier without a route runs the session model, and an unavailable route cannot be allowed', () => {
+  const cfg = routerConfig(normalizeOptions({ routes: { high: 'openai/not-connected#high' } }), [], current);
+  assert.equal(cfg.routes.low.model, kimi);
+  assert.match(cfg.models['openai/not-connected#high'].id, /^unavailable\//);
+  assert.deepEqual(
+    availableModelIds([
+      { providerID: 'a', id: 'b' },
+      { providerID: 'c', id: 'd', enabled: false },
+    ]),
+    ['a/b'],
+  );
+});
 
-  const noAdvice = decideRoute({ config, currentModel: current, advice: null, error: 'unreachable', models: [] });
-  assert.deepEqual(noAdvice.nextModel, current);
-  assert.equal(noAdvice.reason, 'no classifier advice');
-  assert.equal(noAdvice.error, 'unreachable');
+test('a running default variant shares an alias with a route without one', () => {
+  const route = 'openrouter/deepseek/deepseek-v4.1-flash-1017';
+  const cfg = routerConfig(normalizeOptions({ routes: { low: route } }), [], {
+    ...parseModelRef(route),
+    variant: 'default',
+  });
+  assert.deepEqual(Object.keys(cfg.models), [route]);
+});
+
+test('stored messages become the turns lib/facts.mjs reads', () => {
+  const messages = routerMessages([
+    { type: 'user', text: 'Look', files: [{ uri: 'data:image/png;base64,AAAA' }, { uri: 'file:///notes.txt' }] },
+    {
+      type: 'assistant',
+      content: [
+        { type: 'reasoning', text: 'Hm' },
+        { type: 'text', text: 'Seen' },
+      ],
+    },
+    { type: 'idle', outcome: 'succeeded' },
+  ]);
+  assert.deepEqual(messages, [
+    { role: 'user', content: [{ type: 'text', text: 'Look' }, { type: 'image' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Seen' }] },
+  ]);
+  assert.equal(promptHasImages([{ name: 'shot.JPEG' }]), true);
+  assert.equal(promptHasImages([{ uri: 'file:///notes.txt' }]), false);
+  assert.equal(promptHasImages(undefined), false);
+});
+
+test('step tokens become Anthropic-style usage, and overflow text becomes a stop reason', () => {
+  const message = {
+    model: kimiRef,
+    tokens: { input: 4, output: 10, reasoning: 5, cache: { read: 13_743, write: 82 } },
+    finish: 'stop',
+  };
+  assert.deepEqual(usageOf(message), {
+    model: 'openrouter/moonshotai/kimi-k3.1-pro',
+    input_tokens: 4,
+    cache_read_input_tokens: 13_743,
+    cache_creation_input_tokens: 82,
+    output_tokens: 15,
+  });
+  assert.equal(stopReasonOf(message), 'stop');
+  assert.equal(
+    stopReasonOf({ error: { type: 'provider', message: 'prompt is too long: 250000 tokens > 200000 maximum' } }),
+    'model_context_window_exceeded',
+  );
 });
 
 test('a running default variant is the same model as a route without a variant', () => {

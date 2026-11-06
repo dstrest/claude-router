@@ -1,5 +1,4 @@
-import { activeClassifier, loadConfig, TIERS } from '../lib/config.mjs';
-import { decide, initialState } from '../lib/policy.mjs';
+import { activeClassifier, EFFORTS, loadConfig, TIERS } from '../lib/config.mjs';
 
 export function parseModelRef(value) {
   if (typeof value !== 'string') throw new Error('model must be a provider/model string');
@@ -17,6 +16,9 @@ export const formatModelRef = (ref) =>
 
 // OpenCode reports a model without a variant as `default` once it is running.
 export const variantOf = (ref) => (ref?.variant === 'default' ? null : (ref?.variant ?? null));
+
+// The model without its variant: lib/ reads this as the model id, and the host keeps one prompt cache per model.
+export const modelId = (ref) => (ref ? `${ref.providerID}/${ref.id}` : null);
 
 export const sameModel = (a, b) => a?.providerID === b?.providerID && a?.id === b?.id && variantOf(a) === variantOf(b);
 
@@ -48,7 +50,7 @@ function routeMap(routes = {}) {
 }
 
 export function normalizeOptions(options = {}) {
-  const config = loadConfig({ provider: 'kimi' });
+  const config = loadConfig();
   if (options.classifier && !config.classifiers[options.classifier] && options.classifier !== 'jev-openrouter')
     throw new Error(`unknown classifier "${options.classifier}"`);
   if (options.activityRouting && !['on', 'off'].includes(options.activityRouting))
@@ -78,6 +80,8 @@ export function normalizeOptions(options = {}) {
         timeoutMs: 5000,
       },
     },
+    // shortcut: one cache mode for every route; OpenRouter mixes explicit and automatic caches, so upgrade when a host setting names the mode per model.
+    cache: { ...config.cache, effortScope: 'shared' },
     fixedAgents: options.fixedAgents ?? [],
     activityRouting: options.activityRouting ?? config.activityRouting,
     routeRefs: routeMap(options.routes),
@@ -87,113 +91,59 @@ export function normalizeOptions(options = {}) {
   };
 }
 
-// The shared classifier only needs route descriptions and effort labels. Full OpenCode refs stay in routeRefs.
-export function classifierConfig(config, currentModel) {
-  const routes = Object.fromEntries(
-    TIERS.map((tier) => {
-      const ref = config.routeRefs[tier] ?? currentModel;
-      return [tier, { model: formatModelRef(ref), effort: ref?.variant ?? null }];
-    }),
-  );
-  return { ...config, routes };
-}
-
-// shortcut: OpenCode routes carry no prices yet, so switches cost nothing and cost gates never fire; upgrade when usage accounting is ported.
-const noCosts = {
-  switchingTaxUsd: () => 0,
-  downgradeTaxUsd: () => 0,
-  routeCacheKey: (_config, route) => route.model,
-  cacheState: () => 'unknown',
-};
-
-export function decideRoute({
-  config,
-  currentModel,
-  previousTier = null,
-  pin = null,
-  advice,
-  error = null,
-  models,
-  policyState = initialState(),
-  facts = {},
-  now = Date.now(),
-}) {
-  const base = {
-    tierConfidence: advice?.confidence ?? null,
-    error,
-  };
-  if (pin) {
-    const requested = config.routeRefs[pin] ?? currentModel;
+// Effort has no closed list here: variants are per model, so `efforts` stays empty and each variant is its own alias.
+// `strength` keeps two variants of one model ordered, as price cannot.
+function modelSpec(catalog, ref) {
+  if (!available(catalog, ref))
     return {
-      ...base,
-      tier: pin,
-      tierProbability: null,
-      activity: null,
-      activityChoice: null,
-      activityProbability: null,
-      nextModel: available(models, requested) ? requested : currentModel,
-      reason: available(models, requested) ? 'pinned' : 'model unavailable',
+      id: `unavailable/${formatModelRef(ref)}`,
+      contextWindow: 0,
+      input: 0,
+      cacheRead: 0,
+      billing: 'plan',
+      efforts: [],
     };
-  }
-  if (!advice || !TIERS.includes(advice.choice))
-    return {
-      ...base,
-      nextModel: currentModel,
-      reason: advice ? 'classifier uncertain' : 'no classifier advice',
-    };
-  const routeFor = (tier) => ({ model: formatModelRef(config.routeRefs[tier] ?? currentModel), effort: null });
-  // The first decision has no incumbent tier to defend, so it takes the classifier's choice.
-  const step = decide({
-    config: {
-      ...config,
-      models: Object.fromEntries(TIERS.map((tier) => [routeFor(tier).model, { billing: 'plan' }])),
-    },
-    facts: { models: {}, ...facts, lastRoute: previousTier },
-    advice: {
-      ...advice,
-      probabilities: { ...Object.fromEntries(TIERS.map((tier) => [tier, 0])), ...advice.probabilities },
-    },
-    state: policyState,
-    baseline: advice.choice,
-    now,
-    costs: noCosts,
-    routeFor,
-  });
-  const tier = step.tier;
-  const activityAnswer = advice.activity;
-  const activityProbability = activityAnswer ? (activityAnswer.probabilities[activityAnswer.choice] ?? null) : null;
-  const activity =
-    config.activityRouting === 'on' &&
-    activityAnswer &&
-    activityAnswer.choice !== 'uncertain' &&
-    activityProbability >= config.policy.activityMass
-      ? activityAnswer.choice
-      : null;
-  const override = activity ? config.activityRefs[activity]?.[tier] : null;
-  const requested = override ?? config.routeRefs[tier] ?? currentModel;
-  const tierProbability = advice.probabilities[tier] ?? null;
-  if (!available(models, requested))
-    return {
-      ...base,
-      tier,
-      tierProbability,
-      activity,
-      activityProbability,
-      policy: step.state,
-      nextModel: currentModel,
-      reason: 'model unavailable',
-    };
+  const entry = catalog.find((model) => model.providerID === ref.providerID && model.id === ref.id);
+  const [base = {}, long] = [...(entry.cost ?? [])].sort((a, b) => (a.tier?.size ?? 0) - (b.tier?.size ?? 0));
+  const input = base.input ?? 0;
   return {
-    ...base,
-    tier,
-    tierProbability,
-    activity,
-    activityChoice: activityAnswer?.choice ?? null,
-    activityProbability,
-    policy: step.state,
-    nextModel: requested,
-    reason: override ? `activity override (${step.reason})` : step.reason,
+    id: modelId(ref),
+    contextWindow: entry.limit?.context ?? 0,
+    input,
+    cacheRead: base.cache?.read ?? 0,
+    output: base.output,
+    strength: Number.isFinite(base.output) ? base.output + (EFFORTS.indexOf(variantOf(ref)) + 1) / 1000 : undefined,
+    // shortcut: only the first context tier is priced; upgrade if a model bills several.
+    longContext: long?.tier && input > 0 ? { above: long.tier.size, multiplier: long.input / input } : undefined,
+    imageInput: entry.capabilities?.input?.includes('image'),
+    billing: input > 0 ? 'credits' : 'plan',
+    efforts: [],
   };
 }
+
+const UNSET_MODEL = { providerID: 'native', id: 'unset' };
+
+// The shared router's config for one turn: full refs become model aliases, and a tier without a route runs the session's own model.
+export function routerConfig(config, catalog, nativeModel) {
+  const models = {};
+  const route = (ref) => {
+    const model = formatModelRef({ ...ref, variant: variantOf(ref) ?? undefined });
+    models[model] ??= modelSpec(catalog, ref);
+    return { model, effort: null };
+  };
+  const native = nativeModel ?? UNSET_MODEL;
+  const routes = Object.fromEntries(TIERS.map((tier) => [tier, route(config.routeRefs[tier] ?? native)]));
+  const activities = Object.fromEntries(
+    Object.entries(config.activityRefs).map(([activity, cells]) => [
+      activity,
+      Object.fromEntries(Object.entries(cells).map(([tier, ref]) => [tier, route(ref)])),
+    ]),
+  );
+  route(native);
+  return { ...config, models, routes, activities };
+}
+
+export const availableModelIds = (catalog) =>
+  catalog.filter((model) => model.enabled !== false).map((model) => modelId(model));
 
 export const classifierLabel = (config) => activeClassifier(config).label;
