@@ -1749,3 +1749,24 @@ test('the classifier agreement and its wait are reported', async () => {
   assert.equal(report.latency.turns, 1);
   controller.close();
 });
+
+test('a session keeps its variant when a route names its model without one', async () => {
+  const activities = {
+    debug: { low: 'openrouter/moonshotai/kimi-k3.1-pro', medium: 'openrouter/moonshotai/kimi-k3.1-pro' },
+  };
+  const routes = {
+    micro: 'openai/gpt-6.1-sol#high',
+    low: 'openai/gpt-6.1-sol#high',
+    medium: 'openai/gpt-6.1-sol#high',
+    high: 'openai/gpt-6.1-sol#high',
+  };
+  const advice = { ...lowAdvice, activity: { choice: 'debug', probabilities: { debug: 0.9 } } };
+  const { controller, switches, reply } = await harness(advice, routes, [], {}, null, activities);
+  reply();
+  await send(controller);
+  assert.equal(switches.length, 0);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.mode, 'auto');
+  assert.deepEqual(state.nextModel, kimi);
+  controller.close();
+});

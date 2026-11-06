@@ -323,3 +323,16 @@ test('the usage report reads as routing against no routing', () => {
 test('an empty report says so', () => {
   assert.deepEqual(usageLines({ period: 'today', spendUsd: 0, replies: 0 }), ['Usage (today): no replies yet']);
 });
+
+test('a route with no variant on the session model keeps the session variant', () => {
+  const session = parseModelRef('openrouter/moonshotai/kimi-k3.1-pro#high');
+  const config = normalizeOptions({
+    routes: { high: 'openrouter/moonshotai/kimi-k3.1-pro#max' },
+    activities: { debug: { low: 'openrouter/moonshotai/kimi-k3.1-pro' } },
+  });
+  const cfg = routerConfig(config, [], session);
+  assert.equal(cfg.activities.debug.low.model, 'openrouter/moonshotai/kimi-k3.1-pro#high');
+  assert.equal(cfg.routes.high.model, 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  const other = routerConfig(config, [], parseModelRef('openai/gpt-6.1-sol#high'));
+  assert.equal(other.activities.debug.low.model, 'openrouter/moonshotai/kimi-k3.1-pro');
+});

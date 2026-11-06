@@ -169,7 +169,9 @@ const UNSET_MODEL = { providerID: 'native', id: 'unset' };
 // The shared router's config for one turn: full refs become model aliases, and a tier without a route runs the session's own model.
 export function routerConfig(config, catalog, nativeModel, comparedModel = null) {
   const models = {};
-  const route = (ref) => {
+  // A route that names no variant keeps the session's on its own model, as a route with no effort does in Claude Code.
+  const route = (named) => {
+    const ref = !variantOf(named) && modelId(named) === modelId(nativeModel) ? nativeModel : named;
     const model = formatModelRef({ ...ref, variant: variantOf(ref) ?? undefined });
     models[model] ??= modelSpec(catalog, ref);
     return { model, effort: null };
