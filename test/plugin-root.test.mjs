@@ -24,3 +24,9 @@ test('the root package.json declares only the peer dependencies of the OpenCode 
   }
   assert.deepEqual(Object.keys(pkg.peerDependencies).sort(), ['@opentui/core', '@opentui/solid', 'solid-js']);
 });
+
+test('the package carries the files the OpenCode install needs', () => {
+  const { files } = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
+  assert.ok(files.includes('opencode/opencode.example.jsonc'));
+  assert.ok(files.includes('opencode/*.mjs'));
+});

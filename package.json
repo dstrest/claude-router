@@ -31,6 +31,7 @@
     "opencode/*.mjs",
     "opencode/*.ts",
     "opencode/*.tsx",
+    "opencode/opencode.example.jsonc",
     "scripts/migrate-config.mjs",
     "docs/*.md",
     "docs/*.svg",

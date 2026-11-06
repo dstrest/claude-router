@@ -6,7 +6,7 @@ This is an additive OpenCode V2 adapter. The existing Claude Code plugin remains
 
 - Routes each admitted prompt through the selected classifier (Ollama, Jev, Clef, Clef Flash, Clef Omni, or OpenAI).
 - Uses full OpenCode `provider/model#variant` references. Any enabled provider and model is selectable, including OpenRouter's `openrouter/moonshotai/kimi-k3.1-pro`.
-- Shows one line above the composer, `active → next · tier/activity · reason`, fitted to the available width, and raises a `Model changed` toast when the router switches models.
+- Shows one line above the composer, `active → next · tier/activity · classifier · reason`, fitted to the available width. The classifier part is what it chose, such as `Jev high/review 92%`, which can differ from the route when a gate holds the move. It raises a `Model changed` toast when the router switches models.
 - Routes each subagent once, at spawn, from its task text: `high` for a clearly hard task, `micro` for small or exploratory work, and `medium` otherwise. An agent with its own `model`, an explicit model on the call, and a resumed child keep theirs. Set `subagentRouting: "off"` to turn this off.
 - Provides a `/router` session panel with the classifier, confidence, tier and activity probabilities, active and next models, routing reason, configured routes, activity overrides, and recent decisions.
 - Supports automatic/manual routing, one-prompt tier pins, activity routing on/off, and selection from every enabled model and variant.
@@ -14,7 +14,7 @@ This is an additive OpenCode V2 adapter. The existing Claude Code plugin remains
 - Re-reviews a running turn every four provider requests and applies a changed route to a subsequent provider turn.
 - Fails open: classifier and model errors retain the active model and appear in the `/router` panel.
 
-Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Tool results drive failure escalation, the checkpoint a same-task move to a cheaper model waits for, and moves up when a turn's tools show stronger work. 
+Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Tool results drive failure escalation, the checkpoint a same-task move to a cheaper model waits for, and moves up when a turn's tools show stronger work.
 
 ## Install
 
@@ -29,7 +29,7 @@ opencode plugin add "github:dstrest/claude-router"
 To run it from a local checkout instead:
 
 ```sh
-git clone https://github.com/alexei-led/claude-router
+git clone https://github.com/dstrest/claude-router
 cd claude-router
 npm run setup
 npm ci --prefix opencode --ignore-scripts
@@ -53,7 +53,7 @@ Open a session in any directory and run `/router` to confirm it loaded; `opencod
 | `high` tier | Claude Opus 5.5 `#medium` |
 | Web search (`web` subagent) | Kimi K3 |
 
-Agents listed in `fixedAgents` keep their configured model: the router does not classify or switch them. Web search is denied on every other agent, so it has to go through `web`.
+Agents listed in `fixedAgents` keep their configured model: the router does not classify or switch them. Web search is denied on the agents the example lists, so it has to go through `web`.
 
 Use any model reference available in OpenCode. Omit `#variant` for the model default. A tier without a configured route keeps the active model. Activity overrides use the same `activities.<activity>.<tier>` structure as the example.
 
@@ -82,12 +82,12 @@ Commands:
 - `/router mode cost|balanced|quality|default`: set this session's routing mode. See below.
 - `/router classifier [id]`: pick the classifier, from a list when no id is given.
 - `/router timeout <ms>`: set the active classifier's timeout.
-- `/router usage [session|today|7d|30d|month|all]`: show spend, routing against no routing, what the same work would cost on other models, and classifier agreement. Replies are priced at what OpenCode reports. Subagents compare against the model their parent would have run.
+- `/router usage [session|today|7d|30d|month|all]`: show spend, routing against no routing, what the same work would cost on other models, and classifier agreement for this session. Spend is what OpenCode reports; the comparison and What if lines are estimates from list prices, scaled to it. Subagents compare against the model their parent would have run.
 - `/router history delete`: delete the usage kept for every session.
-- `/router undo`: undo the last saved change. Only the last one is kept, and not across a restart.
-- `/router reset`: clear every saved setting, so `opencode.jsonc` applies again.
+- `/router undo`: undo the last saved change. Only the last one is kept, and not across a restart. It covers saved settings, not a session's routing mode.
+- `/router reset`: clear every saved setting, so `opencode.jsonc` applies again. A session's routing mode stays; use `/router mode default` for that.
 
-Subagents use the same controller when their initial prompt passes through OpenCode's prompt hook. Spawn-time routing parity with Claude Code has not been established yet.
+A subagent's model is set by the `execute.before` hook on the `subagent` tool, before its session exists, and it keeps that model for every step. Unlike Claude Code, there is no per-type `subagents.types` table: tiers choose the model, and activity routes do not apply to subagents.
 
 ## Verify
 
