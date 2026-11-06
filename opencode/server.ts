@@ -15,6 +15,15 @@ export default Plugin.define({
       route: ({ sessionID, tier, model }, { error }) =>
         controller.setRoute(sessionID, tier, model).catch((failure) => error('invalid_route', failure.message, null)),
       activity: ({ sessionID, mode }) => controller.setActivity(sessionID, mode),
+      routingMode: ({ sessionID, mode }, { error }) =>
+        controller.setRoutingMode(sessionID, mode).catch((failure) => error('invalid_setting', failure.message, null)),
+      classifier: ({ sessionID, id }, { error }) =>
+        controller.setClassifier(sessionID, id).catch((failure) => error('invalid_setting', failure.message, null)),
+      timeout: ({ sessionID, timeoutMs }, { error }) =>
+        controller.setTimeout(sessionID, timeoutMs).catch((failure) => error('invalid_setting', failure.message, null)),
+      reset: ({ sessionID }) => controller.reset(sessionID),
+      undo: ({ sessionID }, { error }) =>
+        controller.undo(sessionID).catch((failure) => error('invalid_setting', failure.message, null)),
     });
     controller.setPublisher(async (state) => {
       await rpc.events.emit('changed', { sessionID: state.sessionID, state });

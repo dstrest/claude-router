@@ -1,8 +1,11 @@
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
-import { activeClassifier, TIERS } from '../lib/config.mjs';
+import { activeClassifier, ROUTING_MODES, TIERS } from '../lib/config.mjs';
 import { classifierStatus, classifierWarns, NOT_A_TIER_REASON } from '../lib/display.mjs';
 import { observedActivity, promptIndex, routingBucket } from '../lib/facts.mjs';
+import { applyMode, modeLabel, readProjectMode, resolveRoutingMode } from '../lib/modes.mjs';
 import {
   canMoveUp,
   cellForModel,
@@ -60,13 +63,16 @@ const failOpen =
 // Nothing from an earlier routed turn stays once routing stops choosing.
 const NO_ROUTE = { tier: null, activity: null };
 
+const PROFILE_KEY = 'profile';
+const sessionKey = (sessionID) => `session:${sessionID}`;
+const DECISIONS_KEPT = 100;
+
 const initialState = (session) => ({
   sessionID: session.id,
   parentID: session.parentID ?? null,
   agent: session.agent ?? null,
   mode: 'auto',
   phase: 'ready',
-  classifier: { id: null, label: null },
   activeModel: session.model ?? null,
   nextModel: session.model ?? null,
   nativeModel: session.model ?? null,
@@ -82,6 +88,7 @@ const initialState = (session) => ({
   switches: 0,
   switching: false,
   fixed: false,
+  modeOverride: null,
   loop: null,
   observedAt: null,
   generation: 0,
@@ -91,7 +98,19 @@ const initialState = (session) => ({
 });
 
 export async function createController(ctx, options = {}, dependencies = {}) {
-  const config = normalizeOptions(options);
+  // Saved settings overlay the plugin options, a tier at a time, so a later config edit reaches every other tier.
+  const withProfile = (saved) => ({ ...options, ...saved, routes: { ...options.routes, ...saved.routes } });
+  const savedProfile = await ctx.storage.get(PROFILE_KEY).catch(() => null);
+  let profile = savedProfile ?? {};
+  let config;
+  try {
+    config = normalizeOptions(withProfile(profile));
+  } catch (error) {
+    console.error('OpenCode router ignored saved settings', error);
+    profile = {};
+    config = normalizeOptions(options);
+  }
+  let previousProfile = null;
   const sessions = new Map();
   const reviews = new Map();
   const loading = new Map();
@@ -126,6 +145,13 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     }
   }
 
+  // What a session keeps across a restart. The models stay as the host reports them now.
+  function restore(state, saved) {
+    const { activeModel, nextModel, parentID, agent, sessionID } = state;
+    const phase = saved.mode === 'manual' ? 'manual' : 'ready';
+    Object.assign(state, saved, { activeModel, nextModel, parentID, agent, sessionID, phase, switching: false });
+  }
+
   function ensure(sessionID) {
     if (sessions.has(sessionID)) return sessions.get(sessionID);
     // One read per session: a TUI snapshot can race the prompt hook, and each decision must land on the same state.
@@ -136,8 +162,9 @@ export async function createController(ctx, options = {}, dependencies = {}) {
           .get({ sessionID })
           .then(async (session) => {
             const state = initialState(session);
-            state.classifier = { id: config.classifier, label: classifierLabel(config) };
-            if (await startsOff(state))
+            const saved = await ctx.storage.get(sessionKey(sessionID)).catch(() => null);
+            if (saved) restore(state, saved);
+            else if (await startsOff(state))
               Object.assign(state, { mode: 'manual', phase: 'manual', reason: NOT_A_TIER_REASON });
             sessions.set(sessionID, state);
             return state;
@@ -150,12 +177,48 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   async function update(state) {
     state.sequence += 1;
     state.updatedAt = Date.now();
-    await publish(sessionSnapshot(state));
+    await publish(await sessionSnapshot(state));
+    await ctx.storage.set(sessionKey(state.sessionID), JSON.parse(JSON.stringify(state))).catch((error) => {
+      console.error('OpenCode router could not save a session', error);
+    });
   }
 
-  function sessionSnapshot({ loop: _loop, ...state }) {
+  async function projectMode() {
+    const text = await readFile(join(ctx.location.directory, '.opencode/router.json'), 'utf8').catch(() => null);
+    const project = readProjectMode(text);
+    return { ...project, error: project.error?.replace('.claude/', '.opencode/') ?? null };
+  }
+
+  // Session, then project, then profile. A pin runs its configured route, so it takes the balanced routes.
+  async function routingModeOf(state) {
+    const project = await projectMode();
+    const routing = resolveRoutingMode({ session: state.modeOverride, project: project.mode, profile: config.mode });
+    return { routing, projectError: project.error };
+  }
+
+  // A saved, shared setting: validated as options are, then applied to every session.
+  async function saveProfile(next) {
+    config = normalizeOptions(withProfile(next));
+    profile = next;
+    await (Object.keys(profile).length ? ctx.storage.set(PROFILE_KEY, profile) : ctx.storage.remove(PROFILE_KEY));
+    await Promise.all([...sessions.values()].map(update));
+  }
+
+  async function changeProfile(next) {
+    const before = profile;
+    await saveProfile(next);
+    previousProfile = before;
+  }
+
+  async function sessionSnapshot({ loop: _loop, ...state }) {
+    const { routing, projectError } = await routingModeOf(state);
     return {
       ...structuredClone(state),
+      classifier: { id: config.classifier, label: classifierLabel(config) },
+      classifiers: Object.entries(config.classifiers).map(([id, entry]) => ({ id, label: entry.label })),
+      routingMode: modeLabel(routing),
+      projectError,
+      canUndo: previousProfile !== null,
       activityRouting: config.activityRouting,
       routes: Object.fromEntries(Object.entries(config.routeRefs).map(([tier, ref]) => [tier, formatModelRef(ref)])),
       activityRoutes: Object.fromEntries(
@@ -214,14 +277,14 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     state.decisions.unshift({
       at: Date.now(),
       origin,
-      classifier: state.classifier.label,
+      classifier: classifierLabel(config),
       tier: decision.tier ?? null,
       confidence: decision.confidence === undefined ? state.tierConfidence : decision.confidence,
       activity: decision.activity ?? null,
       reason: decision.reason,
       model: formatModelRef(ref ?? state.nextModel),
     });
-    state.decisions.length = Math.min(state.decisions.length, 20);
+    state.decisions.length = Math.min(state.decisions.length, DECISIONS_KEPT);
   }
 
   // An agent's definition as lib/subagents.mjs reads it, or null when the host has none.
@@ -239,8 +302,10 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   async function turnConfig(state) {
     if (!turnConfigs.has(state.sessionID)) {
       const catalog = await listModels();
+      const configured = routerConfig(config, catalog, state.nativeModel);
+      const { routing } = await routingModeOf(state);
       turnConfigs.set(state.sessionID, {
-        cfg: routerConfig(config, catalog, state.nativeModel),
+        cfg: state.pendingPin ? configured : applyMode(configured, routing),
         availableModels: availableModelIds(catalog),
         nativeModel: modelId(state.nativeModel),
       });
@@ -474,17 +539,42 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       const ref = parseModelRef(value);
       const choices = modelOptions(await listModels());
       if (!choices.some((choice) => choice.ref === value)) throw new Error(`model is not available: ${value}`);
-      config.routeRefs[tier] = ref;
-      const state = await ensure(sessionID);
-      await update(state);
-      return sessionSnapshot(state);
+      await changeProfile({ ...profile, routes: { ...profile.routes, [tier]: formatModelRef(ref) } });
+      return sessionSnapshot(await ensure(sessionID));
     },
     async setActivity(sessionID, mode) {
       if (!['on', 'off'].includes(mode)) throw new Error('activity mode must be "on" or "off"');
-      config.activityRouting = mode;
+      await changeProfile({ ...profile, activityRouting: mode });
+      return sessionSnapshot(await ensure(sessionID));
+    },
+    async setRoutingMode(sessionID, mode) {
+      if (mode !== 'default' && !ROUTING_MODES.includes(mode))
+        throw new Error(`mode must be one of ${ROUTING_MODES.join(', ')} or default`);
       const state = await ensure(sessionID);
+      state.modeOverride = mode === 'default' ? null : mode;
       await update(state);
       return sessionSnapshot(state);
+    },
+    async setClassifier(sessionID, id) {
+      await changeProfile({ ...profile, classifier: id });
+      return sessionSnapshot(await ensure(sessionID));
+    },
+    async setTimeout(sessionID, timeoutMs) {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('a timeout must be a positive number of ms');
+      const classifierTimeouts = { ...profile.classifierTimeouts, [config.classifier]: timeoutMs };
+      await changeProfile({ ...profile, classifierTimeouts });
+      return sessionSnapshot(await ensure(sessionID));
+    },
+    async reset(sessionID) {
+      await changeProfile({});
+      return sessionSnapshot(await ensure(sessionID));
+    },
+    async undo(sessionID) {
+      if (previousProfile === null) throw new Error('Nothing to undo.');
+      const before = previousProfile;
+      previousProfile = null;
+      await saveProfile(before);
+      return sessionSnapshot(await ensure(sessionID));
     },
     prompt: failOpen(async (event) => {
       const state = await ensure(event.sessionID);
@@ -596,6 +686,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       cancelReview(sessionID);
       sessions.delete(sessionID);
       turnConfigs.delete(sessionID);
+      return ctx.storage.remove(sessionKey(sessionID)).catch(() => {});
     },
     close() {
       controller.abort();

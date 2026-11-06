@@ -14,7 +14,7 @@ This is an additive OpenCode V2 adapter. The existing Claude Code plugin remains
 - Re-reviews a running turn every four provider requests and applies a changed route to a subsequent provider turn.
 - Fails open: classifier and model errors retain the active model and appear in the `/router` panel.
 
-Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Tool results drive failure escalation, the checkpoint a same-task move to a cheaper model waits for, and moves up when a turn's tools show stronger work. Usage accounting and route-file editing from the Claude adapter are not yet ported. Route changes made through `/router route` or `/router model` are in-memory for this preview, not persisted to `router.json`.
+Routing decisions come from the shared `lib/route.mjs` loop: votes, thresholds, context fit, image support, fallback, sticky activities, switching cost, and the cash gate, priced from the OpenCode catalog. Tool results drive failure escalation, the checkpoint a same-task move to a cheaper model waits for, and moves up when a turn's tools show stronger work. Usage accounting is not yet ported.
 
 ## Install
 
@@ -61,16 +61,27 @@ The default Ollama timeout is 5 seconds. Increase `ollamaTimeoutMs` for a cold l
 
 Other classifiers use the existing shared adapters. Set `classifier` to `jev`, `clef`, `clef-flash`, `clef-omni`, or `openai`, and provide credentials through plugin options or the existing uppercase environment variables (`TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, or `OPENAI_API_KEY`). Do not commit credentials.
 
+## Modes and saved settings
+
+A routing mode trades cost against quality: `cost` takes the cheaper route of the tier below, and `quality` the route of the tier above. Claude Code's `quality` steps effort first; here a variant is its own route, so it moves up a tier. The mode comes from `/router mode` for the session, then `.opencode/router.json` in the project, which may hold only `{ "mode": "cost" }`, then the `mode` plugin option, then `balanced`. `policy` overrides the thresholds in [lib/config.mjs](../lib/config.mjs). `classifiers` adds your own, with `api`, `endpoint`, `model`, and optionally `label`, `keyOption`, and `timeoutMs`.
+
+Sessions, and settings changed with `/router`, are kept in OpenCode's plugin storage and survive a restart. A saved route replaces that tier's route in `opencode.jsonc` until `/router reset`. Other tiers keep following the config. Sessions keep their routing mode, pin, and decisions.
+
 ## Controls
 
 Commands:
 
-- `/router` or `/router decisions`: open the details panel. Press Esc to close it and return to the composer.
+- `/router` or `/router decisions [n]`: open the details panel, showing the last `n` decisions. A session keeps 100. Press Esc to close it and return to the composer.
 - `/router auto` and `/router off`: enable or disable automatic routing. `off` returns the session to its native model. Choosing a model yourself also turns routing off, on that model. A session on a model no route runs starts with routing off.
 - `/router pin <tier>` and `/router unpin`: pin one upcoming prompt to `micro`, `low`, `medium`, or `high`. Pinning needs routing on.
 - `/router model <tier>`: select any enabled model and variant in a searchable dialog.
 - `/router route <tier> <provider/model#variant>`: set a tier route directly.
 - `/router activity on|off`: enable or disable activity overrides.
+- `/router mode cost|balanced|quality|default`: set this session's routing mode. See below.
+- `/router classifier [id]`: pick the classifier, from a list when no id is given.
+- `/router timeout <ms>`: set the active classifier's timeout.
+- `/router undo`: undo the last saved change. Only the last one is kept, and not across a restart.
+- `/router reset`: clear every saved setting, so `opencode.jsonc` applies again.
 
 Subagents use the same controller when their initial prompt passes through OpenCode's prompt hook. Spawn-time routing parity with Claude Code has not been established yet.
 

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { TIERS } from '../lib/config.mjs';
 import { chooseRoute, emptyLoop, nativeFacts } from '../lib/route.mjs';
@@ -36,6 +39,18 @@ const fullAdvice = (advice) =>
     probabilities: { ...Object.fromEntries(TIERS.map((tier) => [tier, 0])), ...advice.probabilities },
   };
 
+const harnessDirectory = mkdtempSync(join(tmpdir(), 'opencode-router-'));
+test.after(() => rmSync(harnessDirectory, { recursive: true, force: true }));
+function memoryStorage() {
+  const entries = new Map();
+  return {
+    entries,
+    get: async (key) => (entries.has(key) ? structuredClone(entries.get(key)) : null),
+    set: async (key, value) => void entries.set(key, structuredClone(value)),
+    remove: async (key) => void entries.delete(key),
+  };
+}
+
 async function harness(
   initialAdvice,
   routes = { high: 'openai/gpt-6.1-sol#high' },
@@ -69,6 +84,8 @@ async function harness(
       },
     },
     model: { list: async () => ({ data: models }) },
+    location: { directory: harnessDirectory },
+    storage: memoryStorage(),
     agent: {
       get: async ({ agentID }) => {
         if (!Object.hasOwn(agents, agentID)) throw new Error('unknown agent');
@@ -76,17 +93,16 @@ async function harness(
       },
     },
   };
+  const harnessAsk = async (input) => {
+    current.asks += 1;
+    calls.push(input);
+    if (current.answer) return current.answer(input);
+    return { advice: fullAdvice(current.advice), error: null };
+  };
   const controller = await createController(
     ctx,
     { classifier: 'ollama', routes, activities, fixedAgents, ...options },
-    dependencies ?? {
-      ask: async (input) => {
-        current.asks += 1;
-        calls.push(input);
-        if (current.answer) return current.answer(input);
-        return { advice: fullAdvice(current.advice), error: null };
-      },
-    },
+    dependencies ?? { ask: harnessAsk },
   );
   controller.setPublisher(async (state) => published.push(state));
   // One provider request that finished: the stored reply lib/route.mjs measures.
@@ -111,6 +127,13 @@ async function harness(
   return {
     ctx,
     controller,
+    // A service restart: a new controller over the same durable storage.
+    restart: () =>
+      createController(
+        ctx,
+        { classifier: 'ollama', routes, activities, fixedAgents, ...options },
+        dependencies ?? { ask: harnessAsk },
+      ),
     switches,
     published,
     calls,
@@ -304,6 +327,8 @@ test('Jev through OpenRouter posts System One with the stored OpenRouter key', a
       switchModel: async () => {},
     },
     model: { list: async () => ({ data: models }) },
+    location: { directory: harnessDirectory },
+    storage: memoryStorage(),
     integration: {
       connection: {
         active: async (id) => ({ id }),
@@ -1260,4 +1285,277 @@ test('nothing from a routed turn stays on the line once routing stops choosing',
   assert.equal(state.tier, null);
   controller.close();
   fixed.controller.close();
+});
+
+const modeRoutes = {
+  low: 'openrouter/cheap/tiny',
+  medium: 'openrouter/moonshotai/kimi-k3.1-pro#high',
+  high: 'openai/gpt-6.1-sol#high',
+};
+const mediumAdvice = { choice: 'medium', confidence: 0.9, probabilities: { medium: 0.9 } };
+
+test('cost mode takes the cheaper route below and quality the route above', async () => {
+  for (const [mode, expected] of [
+    ['balanced', 'openrouter/moonshotai/kimi-k3.1-pro#high'],
+    ['cost', 'openrouter/cheap/tiny'],
+    ['quality', 'openai/gpt-6.1-sol#high'],
+  ]) {
+    const { controller } = await harness(mediumAdvice, modeRoutes, [], { model: openai });
+    await controller.setRoutingMode('ses_test', mode);
+    await send(controller);
+    assert.equal(formatModelRef((await controller.snapshot('ses_test')).nextModel), expected, mode);
+    controller.close();
+  }
+});
+
+test('a pin runs its configured route in any mode', async () => {
+  const { controller } = await harness(mediumAdvice, modeRoutes, [], { model: openai });
+  await controller.setRoutingMode('ses_test', 'cost');
+  await controller.setPin('ses_test', 'medium');
+  await send(controller);
+  assert.equal(formatModelRef((await controller.snapshot('ses_test')).nextModel), modeRoutes.medium);
+  controller.close();
+});
+
+test('a mode comes from the session, then the project, then the profile', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'opencode-router-mode-'));
+  const options = { mode: 'quality' };
+  const { controller, ctx } = await harness(mediumAdvice, modeRoutes, [], {}, null, {}, options);
+  ctx.location = { directory };
+  const label = async () => (await controller.snapshot('ses_test')).routingMode;
+  assert.equal(await label(), 'quality (profile)');
+  mkdirSync(join(directory, '.opencode'));
+  writeFileSync(join(directory, '.opencode/router.json'), '{"mode":"cost"}');
+  assert.equal(await label(), 'cost (project)');
+  await controller.setRoutingMode('ses_test', 'balanced');
+  assert.equal(await label(), 'balanced (session)');
+  await controller.setRoutingMode('ses_test', 'default');
+  assert.equal(await label(), 'cost (project)');
+  writeFileSync(join(directory, '.opencode/router.json'), '{"mode":"cost","routes":{}}');
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.routingMode, 'quality (profile)');
+  assert.match(state.projectError, /\.opencode\/router\.json may only set mode/);
+  controller.close();
+  rmSync(directory, { recursive: true, force: true });
+});
+
+test('an unknown mode is refused', async () => {
+  const { controller } = await harness(highAdvice);
+  await assert.rejects(() => controller.setRoutingMode('ses_test', 'turbo'), /mode must be/);
+  await assert.rejects(() => harness(highAdvice, undefined, [], {}, null, {}, { mode: 'turbo' }), /mode must be/);
+  controller.close();
+});
+
+test('policy options override the defaults and bad ones are refused', async () => {
+  const { controller, asks, steps } = await harness(
+    highAdvice,
+    undefined,
+    [],
+    {},
+    null,
+    {},
+    {
+      policy: { reviewEveryRequests: 2 },
+    },
+  );
+  await send(controller);
+  await steps(3);
+  assert.equal(asks(), 2);
+  controller.close();
+  await assert.rejects(() => harness(highAdvice, undefined, [], {}, null, {}, { policy: { nope: 1 } }), /policy/);
+  await assert.rejects(
+    () => harness(highAdvice, undefined, [], {}, null, {}, { policy: { upgradeBase: 'high' } }),
+    /policy/,
+  );
+});
+
+test('a session survives a restart: mode, pin, votes, decisions and native model', async () => {
+  const { controller, restart, setAdvice, step, switches } = await harness(lowAdvice, planRoutes);
+  await send(controller);
+  await step();
+  setAdvice(highAdvice);
+  await send(controller, 'First vote');
+  await step();
+  await controller.setRoutingMode('ses_test', 'cost');
+  await controller.setPin('ses_test', 'low');
+  const before = await controller.snapshot('ses_test');
+  controller.close();
+  const next = await restart();
+  const after = await next.snapshot('ses_test');
+  assert.equal(after.routingMode, 'cost (session)');
+  assert.equal(after.pendingPin, 'low');
+  assert.equal(after.decisions.length, before.decisions.length);
+  assert.ok(after.sequence >= before.sequence);
+  assert.deepEqual(after.nativeModel, kimi);
+  await next.setPin('ses_test', null);
+  await next.setRoutingMode('ses_test', 'default');
+  await send(next, 'Second vote');
+  assert.equal((await next.snapshot('ses_test')).reason, 'upgrade');
+  assert.deepEqual(switches.at(-1).model, openai);
+  next.close();
+});
+
+test('routing off survives a restart, and does not count as a manual start', async () => {
+  const { controller, restart } = await harness(highAdvice);
+  await controller.setMode('ses_test', 'manual');
+  controller.close();
+  const next = await restart();
+  assert.equal((await next.snapshot('ses_test')).mode, 'manual');
+  assert.equal((await next.snapshot('ses_test')).reason, 'routing off');
+  next.close();
+});
+
+test('a saved session on an unknown phase does not restart as choosing', async () => {
+  const { controller, ctx, restart } = await harness(highAdvice);
+  await controller.snapshot('ses_test');
+  await send(controller);
+  controller.close();
+  const key = [...ctx.storage.entries.keys()].find((name) => name.includes('ses_test'));
+  ctx.storage.entries.set(key, { ...ctx.storage.entries.get(key), phase: 'choosing' });
+  const next = await restart();
+  assert.equal((await next.snapshot('ses_test')).phase, 'ready');
+  next.close();
+});
+
+test('a deleted session leaves nothing saved', async () => {
+  const { controller, ctx } = await harness(highAdvice);
+  await send(controller);
+  await controller.remove('ses_test');
+  assert.equal(
+    [...ctx.storage.entries.keys()].some((name) => name.includes('ses_test')),
+    false,
+  );
+  controller.close();
+});
+
+test('a storage failure never blocks a hook or a publish', async (t) => {
+  const log = quietConsole(t);
+  const { controller, ctx, published } = await harness(highAdvice);
+  ctx.storage.set = async () => {
+    throw new Error('disk full');
+  };
+  await send(controller);
+  assert.equal(published.at(-1).tier, 'high');
+  assert.ok(log.mock.callCount() > 0);
+  controller.close();
+});
+
+test('route edits survive a restart, reach every session, and can be undone', async () => {
+  const { controller, restart, published } = await harness(highAdvice);
+  await controller.snapshot('ses_other');
+  await controller.setRoute('ses_test', 'high', 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  assert.equal(
+    published.findLast((state) => state.sessionID === 'ses_other').routes.high,
+    'openrouter/moonshotai/kimi-k3.1-pro#max',
+  );
+  await controller.setActivity('ses_test', 'off');
+  controller.close();
+  const next = await restart();
+  let state = await next.snapshot('ses_test');
+  assert.equal(state.routes.high, 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  assert.equal(state.activityRouting, 'off');
+  assert.equal(state.canUndo, false);
+  await next.setActivity('ses_test', 'on');
+  await next.undo('ses_test');
+  state = await next.snapshot('ses_test');
+  assert.equal(state.activityRouting, 'off');
+  assert.equal(state.canUndo, false);
+  await assert.rejects(() => next.undo('ses_test'), /Nothing to undo/);
+  next.close();
+});
+
+test('saved settings that no longer validate are ignored', async (t) => {
+  const log = quietConsole(t);
+  const { controller, ctx, restart } = await harness(highAdvice);
+  await controller.setActivity('ses_test', 'off');
+  controller.close();
+  const key = [...ctx.storage.entries.keys()].find((name) => !name.startsWith('session'));
+  ctx.storage.entries.set(key, { classifier: 'gone' });
+  const next = await restart();
+  assert.equal((await next.snapshot('ses_test')).classifier.id, 'ollama');
+  assert.equal(log.mock.callCount(), 1);
+  next.close();
+});
+
+test('a custom classifier can be configured and picked, and a bad one is refused', async () => {
+  const classifiers = {
+    mine: { label: 'Mine', api: 'ollama', endpoint: 'http://localhost:9/api', model: 'm', keyOption: null },
+  };
+  const { controller, calls } = await harness(highAdvice, undefined, [], {}, null, {}, { classifiers });
+  await controller.setClassifier('ses_test', 'mine');
+  const state = await controller.snapshot('ses_test');
+  assert.deepEqual(state.classifier, { id: 'mine', label: 'Mine' });
+  assert.ok(state.classifiers.some((entry) => entry.id === 'mine' && entry.label === 'Mine'));
+  await send(controller);
+  assert.equal(calls[0].config.classifier, 'mine');
+  await assert.rejects(() => controller.setClassifier('ses_test', 'nope'), /unknown classifier/);
+  controller.close();
+  await assert.rejects(
+    () => harness(highAdvice, undefined, [], {}, null, {}, { classifiers: { bad: { api: 'carrier-pigeon' } } }),
+    /classifiers\.bad/,
+  );
+});
+
+test('the classifier timeout can be set and a bad one is refused', async () => {
+  const { controller, calls } = await harness(highAdvice);
+  await controller.setTimeout('ses_test', 12_000);
+  await send(controller);
+  assert.equal(calls[0].config.classifiers.ollama.timeoutMs, 12_000);
+  await assert.rejects(() => controller.setTimeout('ses_test', -1), /positive/);
+  controller.close();
+});
+
+test('a session keeps a hundred decisions', async () => {
+  const { controller } = await harness(lowAdvice);
+  for (let turn = 0; turn < 105; turn += 1) await send(controller, `Turn ${turn}`);
+  assert.equal((await controller.snapshot('ses_test')).decisions.length, 100);
+  controller.close();
+});
+
+test('undoing the first edit removes it', async () => {
+  const { controller, restart } = await harness(highAdvice);
+  const route = (await controller.snapshot('ses_test')).routes.high;
+  await controller.setRoute('ses_test', 'high', 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  await controller.undo('ses_test');
+  assert.equal((await controller.snapshot('ses_test')).routes.high, route);
+  controller.close();
+  const next = await restart();
+  assert.equal((await next.snapshot('ses_test')).routes.high, route);
+  next.close();
+});
+
+test('a route edit saves only its tier, so the other tiers still follow the config', async () => {
+  const { controller, ctx } = await harness(highAdvice, planRoutes);
+  await controller.setRoute('ses_test', 'high', 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  controller.close();
+  const edited = { ...planRoutes, low: 'openrouter/cheap/tiny' };
+  const next = await createController(ctx, { classifier: 'ollama', routes: edited });
+  const { routes } = await next.snapshot('ses_test');
+  assert.equal(routes.low, 'openrouter/cheap/tiny');
+  assert.equal(routes.high, 'openrouter/moonshotai/kimi-k3.1-pro#max');
+  next.close();
+});
+
+test('reset clears saved settings back to the config, and can be undone', async () => {
+  const { controller, ctx, restart } = await harness(highAdvice, planRoutes);
+  const route = 'openrouter/moonshotai/kimi-k3.1-pro#max';
+  await controller.setRoute('ses_test', 'high', route);
+  await controller.setActivity('ses_test', 'off');
+  await controller.reset('ses_test');
+  let state = await controller.snapshot('ses_test');
+  assert.equal(state.routes.high, planRoutes.high);
+  assert.equal(state.activityRouting, 'on');
+  assert.equal(state.canUndo, true);
+  await controller.undo('ses_test');
+  state = await controller.snapshot('ses_test');
+  assert.equal(state.routes.high, route);
+  await controller.reset('ses_test');
+  controller.close();
+  assert.deepEqual(
+    [...ctx.storage.entries.keys()].filter((key) => !key.startsWith('session')),
+    [],
+  );
+  const next = await restart();
+  assert.equal((await next.snapshot('ses_test')).routes.high, planRoutes.high);
+  next.close();
 });

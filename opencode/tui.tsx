@@ -20,7 +20,11 @@ type RouterState = {
   switches: number;
   mode: string;
   phase: string;
-  classifier: { label: string };
+  classifier: { id: string; label: string };
+  classifiers: { id: string; label: string }[];
+  routingMode: string;
+  projectError: string | null;
+  canUndo: boolean;
   activeModel: ModelRef | null;
   nextModel: ModelRef | null;
   tier: string | null;
@@ -45,6 +49,7 @@ export default Plugin.define({
     const requestOptions = { location: context.location ?? context.data.location.default() };
     const [states, setStates] = createSignal<Record<string, RouterState>>({});
     const [loadErrors, setLoadErrors] = createSignal<Record<string, string | undefined>>({});
+    const [decisionRows, setDecisionRows] = createSignal(8);
     const update = (result: unknown) => {
       const state = result as RouterState;
       const notice = switchNotice(states()[state.sessionID], state);
@@ -106,6 +111,7 @@ export default Plugin.define({
               <text>{`Next: ${formatModelRef(value().nextModel)}`}</text>
               <text>{`Why: ${shortReason(value().reason, value().activity) || '—'}${value().error ? ` · ${value().error}` : ''}`}</text>
               <text>{`Pin: ${value().pendingPin ?? 'none'} · activity routing: ${value().activityRouting}`}</text>
+              <text>{`Mode: ${value().routingMode}${value().projectError ? ` · ${value().projectError}` : ''}`}</text>
               <text>Routes</text>
               <For each={tiers}>
                 {(tier) => <text>{`  ${tier}: ${value().routes[tier] ?? 'active model (no override)'}`}</text>}
@@ -122,7 +128,7 @@ export default Plugin.define({
               </Show>
               <text>Recent decisions</text>
               <Show when={value().decisions.length} fallback={<text> No decisions yet</text>}>
-                <For each={value().decisions.slice(0, 8)}>
+                <For each={value().decisions.slice(0, decisionRows())}>
                   {(decision) => (
                     <text>{`  ${decision.origin} · ${decision.tier ?? '—'} · ${decision.activity ?? 'base'} · ${decision.model} · ${shortReason(decision.reason, decision.activity)}`}</text>
                   )}
@@ -130,7 +136,8 @@ export default Plugin.define({
               </Show>
               <text>
                 Commands: /router auto|off · /router pin &lt;tier&gt; · /router unpin · /router model &lt;tier&gt; ·
-                /router activity on|off
+                /router activity on|off · /router mode &lt;mode&gt; · /router classifier · /router timeout &lt;ms&gt; ·
+                /router reset · /router undo · /router decisions [n]
               </text>
             </box>
           )}
@@ -177,10 +184,32 @@ export default Plugin.define({
           current: states()[sessionID]?.routes[tier],
         });
         if (selected) update(await router.route({ sessionID, tier, model: selected }, requestOptions));
+      } else if (command === 'mode') {
+        update(await router.routingMode({ sessionID, mode: args[0] ?? 'default' }, requestOptions));
+      } else if (command === 'classifier') {
+        const options = states()[sessionID]?.classifiers ?? [];
+        const id =
+          args[0] ??
+          (await context.ui.dialog.select({
+            title: 'Select a classifier',
+            options: options.map((entry) => ({ title: entry.label, description: entry.id, value: entry.id })),
+            current: states()[sessionID]?.classifier.id,
+          }));
+        if (id) update(await router.classifier({ sessionID, id }, requestOptions));
+      } else if (command === 'timeout') {
+        update(await router.timeout({ sessionID, timeoutMs: Number(args[0]) }, requestOptions));
+      } else if (command === 'reset') {
+        update(await router.reset({ sessionID }, requestOptions));
+      } else if (command === 'undo') {
+        update(await router.undo({ sessionID }, requestOptions));
       } else if (command === 'decisions') {
+        if (args[0]) setDecisionRows(Math.max(1, Number.parseInt(args[0], 10) || 8));
         await context.ui.panel.open('router');
+        return;
       } else {
-        throw new Error('usage: /router [auto|off|pin <tier>|unpin|model <tier>|route <tier> <model>|activity on|off]');
+        throw new Error(
+          'usage: /router [auto|off|pin <tier>|unpin|model <tier>|route <tier> <model>|activity on|off|mode <mode>|classifier [id]|timeout <ms>|reset|undo|decisions [n]]',
+        );
       }
       context.ui.toast.show({ title: 'Router', message: 'Router state updated', variant: 'success' });
     };

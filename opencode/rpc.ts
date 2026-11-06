@@ -43,6 +43,27 @@ export const RouterRpc = Rpc.define({
       output: state,
       errors: { invalid_pin: { type: 'null' } },
     },
+    routingMode: {
+      input: sessionInput({ mode: { type: 'string' } }, ['mode']),
+      output: state,
+      errors: { invalid_setting: { type: 'null' } },
+    },
+    classifier: {
+      input: sessionInput({ id: { type: 'string' } }, ['id']),
+      output: state,
+      errors: { invalid_setting: { type: 'null' } },
+    },
+    timeout: {
+      input: sessionInput({ timeoutMs: { type: 'number' } }, ['timeoutMs']),
+      output: state,
+      errors: { invalid_setting: { type: 'null' } },
+    },
+    reset: { input: sessionInput({}), output: state },
+    undo: {
+      input: sessionInput({}),
+      output: state,
+      errors: { invalid_setting: { type: 'null' } },
+    },
     route: {
       input: sessionInput({ tier: { type: 'string', enum: tiers }, model: { type: 'string' } }, ['tier', 'model']),
       output: state,

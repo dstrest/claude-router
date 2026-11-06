@@ -1,4 +1,12 @@
-import { activeClassifier, EFFORTS, loadConfig, SUBAGENT_MODES, TIERS } from '../lib/config.mjs';
+import {
+  activeClassifier,
+  CLASSIFIER_APIS,
+  EFFORTS,
+  loadConfig,
+  ROUTING_MODES,
+  SUBAGENT_MODES,
+  TIERS,
+} from '../lib/config.mjs';
 
 export function parseModelRef(value) {
   if (typeof value !== 'string') throw new Error('model must be a provider/model string');
@@ -49,10 +57,32 @@ function routeMap(routes = {}) {
   return Object.fromEntries(Object.entries(routes).map(([tier, ref]) => [tier, parseModelRef(ref)]));
 }
 
+const positive = (value) => Number.isFinite(value) && value > 0;
+
+function customClassifiers(entries = {}) {
+  return Object.fromEntries(
+    Object.entries(entries).map(([id, entry]) => {
+      const { label = id, api = 'system-one', endpoint, model, keyOption = null, timeoutMs = 5000 } = entry ?? {};
+      if (!CLASSIFIER_APIS.includes(api))
+        throw new Error(`classifiers.${id}.api must be one of ${CLASSIFIER_APIS.join(', ')}`);
+      if (typeof endpoint !== 'string' || typeof model !== 'string')
+        throw new Error(`classifiers.${id} needs an endpoint and a model`);
+      if (!positive(timeoutMs)) throw new Error(`classifiers.${id}.timeoutMs must be a positive number`);
+      return [id, { label, api, endpoint, model, keyOption, timeoutMs }];
+    }),
+  );
+}
+
+function checkedPolicy(policy, overrides = {}) {
+  for (const [key, value] of Object.entries(overrides))
+    if (!Object.hasOwn(policy, key) || !Number.isFinite(value)) throw new Error(`policy.${key} is not a known number`);
+  return { ...policy, ...overrides };
+}
+
 export function normalizeOptions(options = {}) {
   const config = loadConfig();
-  if (options.classifier && !config.classifiers[options.classifier] && options.classifier !== 'jev-openrouter')
-    throw new Error(`unknown classifier "${options.classifier}"`);
+  if (options.mode && !ROUTING_MODES.includes(options.mode))
+    throw new Error(`mode must be one of ${ROUTING_MODES.join(', ')}`);
   if (options.activityRouting && !['on', 'off'].includes(options.activityRouting))
     throw new Error('activityRouting must be "on" or "off"');
   if (options.subagentRouting && !SUBAGENT_MODES.includes(options.subagentRouting))
@@ -62,26 +92,36 @@ export function normalizeOptions(options = {}) {
     (!Number.isFinite(options.ollamaTimeoutMs) || options.ollamaTimeoutMs <= 0)
   )
     throw new Error('ollamaTimeoutMs must be a positive number');
+  const classifiers = {
+    ...config.classifiers,
+    ollama: {
+      ...config.classifiers.ollama,
+      ...(options.ollamaModel ? { model: options.ollamaModel } : {}),
+      ...(options.ollamaEndpoint ? { endpoint: options.ollamaEndpoint } : {}),
+      ...(options.ollamaTimeoutMs ? { timeoutMs: options.ollamaTimeoutMs } : {}),
+    },
+    'jev-openrouter': {
+      label: 'Jev (OpenRouter)',
+      api: 'system-one',
+      endpoint: 'https://openrouter.ai/api/v1/systemone',
+      model: 'typesafe/jev-1.14',
+      keyOption: 'openrouter_api_key',
+      timeoutMs: 5000,
+    },
+    ...customClassifiers(options.classifiers),
+  };
+  const classifier = options.classifier ?? config.classifier;
+  if (!classifiers[classifier]) throw new Error(`unknown classifier "${classifier}"`);
+  for (const [id, timeoutMs] of Object.entries(options.classifierTimeouts ?? {})) {
+    if (!classifiers[id] || !positive(timeoutMs)) throw new Error('a classifier timeout must be positive');
+    classifiers[id] = { ...classifiers[id], timeoutMs };
+  }
   return {
     ...config,
-    classifier: options.classifier ?? config.classifier,
-    classifiers: {
-      ...config.classifiers,
-      ollama: {
-        ...config.classifiers.ollama,
-        ...(options.ollamaModel ? { model: options.ollamaModel } : {}),
-        ...(options.ollamaEndpoint ? { endpoint: options.ollamaEndpoint } : {}),
-        ...(options.ollamaTimeoutMs ? { timeoutMs: options.ollamaTimeoutMs } : {}),
-      },
-      'jev-openrouter': {
-        label: 'Jev (OpenRouter)',
-        api: 'system-one',
-        endpoint: 'https://openrouter.ai/api/v1/systemone',
-        model: 'typesafe/jev-1.14',
-        keyOption: 'openrouter_api_key',
-        timeoutMs: 5000,
-      },
-    },
+    classifier,
+    classifiers,
+    mode: options.mode ?? config.mode,
+    policy: checkedPolicy(config.policy, options.policy),
     // shortcut: one cache mode for every route; OpenRouter mixes explicit and automatic caches, so upgrade when a host setting names the mode per model.
     cache: { ...config.cache, effortScope: 'shared' },
     fixedAgents: options.fixedAgents ?? [],
