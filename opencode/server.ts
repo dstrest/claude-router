@@ -10,7 +10,8 @@ export default Plugin.define({
       snapshot: ({ sessionID }) => controller.snapshot(sessionID),
       models: () => controller.models(),
       mode: ({ sessionID, mode }) => controller.setMode(sessionID, mode),
-      pin: ({ sessionID, tier }) => controller.setPin(sessionID, tier),
+      pin: ({ sessionID, tier }, { error }) =>
+        controller.setPin(sessionID, tier).catch((failure) => error('invalid_pin', failure.message, null)),
       route: ({ sessionID, tier, model }, { error }) =>
         controller.setRoute(sessionID, tier, model).catch((failure) => error('invalid_route', failure.message, null)),
       activity: ({ sessionID, mode }) => controller.setActivity(sessionID, mode),
@@ -26,11 +27,12 @@ export default Plugin.define({
     const events = new AbortController();
     void (async () => {
       for await (const event of ctx.event.subscribe({
-        types: ['session.idle', 'session.deleted'],
+        types: ['session.idle', 'session.deleted', 'session.compaction.ended', 'session.revert.committed'],
         signal: events.signal,
       })) {
         if (event.type === 'session.idle') await controller.idle(event.data.sessionID);
-        else controller.remove(event.data.sessionID);
+        else if (event.type === 'session.deleted') controller.remove(event.data.sessionID);
+        else await controller.resetHistory(event.data.sessionID);
       }
     })().catch((error) => {
       if (!events.signal.aborted) console.error('OpenCode router event stream failed', error);

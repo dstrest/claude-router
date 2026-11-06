@@ -41,6 +41,7 @@ export const RouterRpc = Rpc.define({
     pin: {
       input: sessionInput({ tier: { anyOf: [{ type: 'string', enum: tiers }, { type: 'null' }] } }, ['tier']),
       output: state,
+      errors: { invalid_pin: { type: 'null' } },
     },
     route: {
       input: sessionInput({ tier: { type: 'string', enum: tiers }, model: { type: 'string' } }, ['tier', 'model']),

@@ -55,7 +55,13 @@ async function harness(
   const ctx = {
     options: {},
     session: {
-      get: async ({ sessionID }) => ({ id: sessionID, agent: 'build', ...sessionFields, model: selected.model }),
+      get: async ({ sessionID }) => ({
+        id: sessionID,
+        agent: selected.agent ?? 'build',
+        ...sessionFields,
+        model: selected.model,
+        time: selected.time,
+      }),
       context: async () => stored,
       switchModel: async (input) => {
         switches.push(input);
@@ -115,6 +121,14 @@ async function harness(
       for (let request = 0; request < count; request += 1) await step();
     },
     asks: () => current.asks,
+    // What the TUI's commit on submit does: the session's selection changes before the prompt hook runs.
+    setRunning: (running) => {
+      selected.time = running ? { busy: 2, idle: 1 } : { busy: 1, idle: 2 };
+    },
+    selectModel: (model, agent) => {
+      selected.model = model;
+      if (agent) selected.agent = agent;
+    },
     setAnswer: (answer) => {
       current.answer = answer;
     },
@@ -992,4 +1006,258 @@ test('a main session on an agent with its own model is left alone', async () => 
   assert.equal(switches.length, 0);
   assert.equal((await controller.snapshot('ses_test')).reason, 'fixed agent web');
   controller.close();
+});
+
+test('off returns the session to its native model and clears a pin', async () => {
+  const { controller, switches, published } = await harness(highAdvice);
+  await send(controller);
+  await controller.setPin('ses_test', 'low');
+  await controller.setMode('ses_test', 'manual');
+  assert.deepEqual(switches.at(-1), { sessionID: 'ses_test', model: kimi });
+  const state = published.at(-1);
+  assert.equal(state.pendingPin, null);
+  assert.deepEqual(state.nextModel, kimi);
+  assert.equal(state.reason, 'routing off');
+  assert.equal(state.switches, 1);
+  controller.close();
+});
+
+test('off cancels a running review', async () => {
+  const { controller, calls, setAnswer, steps } = await harness(highAdvice);
+  await send(controller);
+  setAnswer(() => new Promise(() => {}));
+  await steps(5);
+  await controller.setMode('ses_test', 'manual');
+  assert.equal(calls[1].signal.aborted, true);
+  controller.close();
+});
+
+test('a refused return to the native model is reported', async () => {
+  const { controller, ctx, published } = await harness(highAdvice);
+  await send(controller);
+  ctx.session.switchModel = async () => {
+    throw new Error('rejected');
+  };
+  await controller.setMode('ses_test', 'manual');
+  assert.equal(published.at(-1).mode, 'manual');
+  assert.equal(published.at(-1).error, 'rejected');
+  controller.close();
+});
+
+test('routing resumes after off', async () => {
+  const { controller, switches, step } = await harness(highAdvice);
+  await send(controller);
+  await step();
+  await controller.setMode('ses_test', 'manual');
+  await send(controller, 'Off');
+  await step();
+  await controller.setMode('ses_test', 'auto');
+  await send(controller, 'On again');
+  assert.deepEqual(switches.at(-1).model, openai);
+  controller.close();
+});
+
+test('a session on a model no route runs starts with routing off', async () => {
+  const routes = { micro: 'openai/gpt-6.1-sol#high', low: 'openai/gpt-6.1-sol#high' };
+  const full = { ...routes, medium: 'openai/gpt-6.1-sol#high', high: 'openai/gpt-6.1-sol#high' };
+  const { controller, asks } = await harness(highAdvice, full);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.mode, 'manual');
+  assert.equal(state.phase, 'manual');
+  assert.equal(state.reason, 'not a routing tier');
+  await send(controller);
+  assert.equal(asks(), 0);
+  controller.close();
+  const routed = await harness(highAdvice, { ...full, medium: 'openrouter/moonshotai/kimi-k3.1-pro#max' });
+  assert.equal((await routed.controller.snapshot('ses_test')).mode, 'auto');
+  routed.controller.close();
+});
+
+test('a catalog failure at the start leaves routing on', async () => {
+  const { controller, ctx } = await harness(highAdvice);
+  ctx.model.list = async () => {
+    throw new Error('host down');
+  };
+  assert.equal((await controller.snapshot('ses_test')).mode, 'auto');
+  controller.close();
+});
+
+test('a pin needs routing on', async () => {
+  const { controller } = await harness(highAdvice);
+  await controller.setMode('ses_test', 'manual');
+  await assert.rejects(() => controller.setPin('ses_test', 'low'), /Routing is off/);
+  assert.equal((await controller.setPin('ses_test', null)).pendingPin, null);
+  controller.close();
+});
+
+test('a model the user selects turns routing off, and the prompt runs on it', async () => {
+  const { controller, asks, switches, selectModel, step } = await harness(lowAdvice, planRoutes);
+  await send(controller);
+  await step();
+  const before = asks();
+  selectModel(tiny);
+  await send(controller, 'Use this one');
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.mode, 'manual');
+  assert.equal(state.reason, 'model selected manually');
+  assert.deepEqual(state.nextModel, tiny);
+  assert.equal(asks(), before);
+  assert.equal(switches.length, 0);
+  controller.close();
+});
+
+test('off returns to the model selected while routing was off', async () => {
+  const { controller, switches, selectModel, step } = await harness(highAdvice);
+  await send(controller);
+  await step();
+  selectModel(tiny);
+  await send(controller, 'Mine');
+  await controller.setMode('ses_test', 'auto');
+  await send(controller, 'Routed');
+  assert.deepEqual(switches.at(-1).model, openai);
+  await controller.setMode('ses_test', 'manual');
+  assert.deepEqual(switches.at(-1).model, tiny);
+  controller.close();
+});
+
+test('an agent switch that changes the model does not turn routing off', async () => {
+  const { controller, selectModel, step, asks } = await harness(lowAdvice, planRoutes);
+  await send(controller);
+  await step();
+  selectModel(openai, 'general');
+  await send(controller, 'Other agent');
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.mode, 'auto');
+  assert.equal(asks(), 2);
+  controller.close();
+});
+
+test('the router switching a model is not a manual change', async () => {
+  const { controller, step } = await harness(highAdvice);
+  await send(controller);
+  await step();
+  await send(controller, 'Again');
+  assert.equal((await controller.snapshot('ses_test')).mode, 'auto');
+  controller.close();
+});
+
+test('a switch still in flight when a prompt arrives is not a manual change', async () => {
+  const { controller, ctx, selectModel, setAnswer, steps, setAdvice } = await harness(lowAdvice, planRoutes);
+  await send(controller);
+  await steps(5);
+  const release = {};
+  const held = new Promise((resolve) => {
+    release.go = resolve;
+  });
+  let holding = true;
+  ctx.session.switchModel = async ({ model }) => {
+    selectModel(model);
+    if (holding) {
+      holding = false;
+      await held;
+    }
+  };
+  setAnswer(null);
+  setAdvice({ choice: 'high', confidence: 0.99, probabilities: { high: 0.99 } });
+  await steps(5);
+  await send(controller, 'During the switch');
+  release.go();
+  await settle();
+  assert.equal((await controller.snapshot('ses_test')).mode, 'auto');
+  controller.close();
+});
+
+test('a prompt steered into a running turn is not a turn', async () => {
+  const { controller, asks, calls, setAnswer, setRunning, steps } = await harness(highAdvice);
+  await send(controller);
+  setAnswer(() => new Promise(() => {}));
+  await steps(5);
+  const before = asks();
+  setRunning(true);
+  await send(controller, 'Also check the docs');
+  assert.equal(asks(), before);
+  assert.equal(calls[1].signal.aborted, false);
+  setRunning(false);
+  setAnswer(null);
+  await send(controller, 'A new turn');
+  assert.equal(asks(), before + 1);
+  controller.close();
+});
+
+test('a pin waits through a steered prompt for the next turn', async () => {
+  const { controller, setRunning, step } = await harness(highAdvice);
+  await send(controller);
+  await step();
+  await controller.setPin('ses_test', 'low');
+  setRunning(true);
+  await send(controller, 'Steered');
+  assert.equal((await controller.snapshot('ses_test')).pendingPin, 'low');
+  setRunning(false);
+  await send(controller, 'New turn');
+  assert.equal((await controller.snapshot('ses_test')).pendingPin, null);
+  controller.close();
+});
+
+test('a turn that ends while the classifier runs reads as interrupted', async () => {
+  const { controller, setAnswer } = await harness(highAdvice);
+  const release = {};
+  setAnswer(
+    () =>
+      new Promise((resolve) => {
+        release.go = () => resolve({ advice: null, error: 'cancelled' });
+      }),
+  );
+  const prompt = send(controller);
+  await settle();
+  await controller.idle('ses_test');
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.phase, 'ready');
+  assert.equal(state.reason, 'interrupted');
+  release.go();
+  await prompt;
+  controller.close();
+});
+
+test('compaction or a rewind clears the votes and the cache, and drops a running review', async () => {
+  const { controller, calls, setAnswer, setAdvice, steps, step } = await harness(lowAdvice, planRoutes);
+  await send(controller);
+  await step();
+  setAdvice(highAdvice);
+  await send(controller, 'First vote');
+  assert.equal((await controller.snapshot('ses_test')).reason, 'upgrade-pending');
+  await step();
+  setAnswer(() => new Promise(() => {}));
+  await steps(5);
+  await controller.resetHistory('ses_test');
+  assert.equal(calls.at(-1).signal.aborted, true);
+  controller.close();
+});
+
+test('a reset is a no-op for a session the router has not seen', async () => {
+  const { controller } = await harness(highAdvice);
+  await controller.resetHistory('ses_unknown');
+  controller.close();
+});
+
+test('nothing from a routed turn stays on the line once routing stops choosing', async () => {
+  const { controller, step } = await harness(highAdvice);
+  await send(controller);
+  await step();
+  assert.equal((await controller.snapshot('ses_test')).tier, 'high');
+  await controller.setMode('ses_test', 'manual');
+  let state = await controller.snapshot('ses_test');
+  assert.equal(state.tier, null);
+  assert.equal(state.activity, null);
+  await controller.setMode('ses_test', 'auto');
+  await send(controller, 'Routed');
+  assert.equal((await controller.snapshot('ses_test')).tier, 'high');
+  const fixed = await harness(highAdvice, undefined, [], {}, null, {}, {}, { build: {}, plan: { model: tiny } });
+  await send(fixed.controller);
+  fixed.selectModel(tiny, 'plan');
+  await send(fixed.controller, 'Plan agent');
+  state = await fixed.controller.snapshot('ses_test');
+  assert.equal(state.reason, 'fixed agent plan');
+  assert.equal(state.tier, null);
+  controller.close();
+  fixed.controller.close();
 });

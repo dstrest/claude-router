@@ -66,8 +66,8 @@ Other classifiers use the existing shared adapters. Set `classifier` to `jev`, `
 Commands:
 
 - `/router` or `/router decisions`: open the details panel. Press Esc to close it and return to the composer.
-- `/router auto` and `/router off`: enable or disable automatic routing.
-- `/router pin <tier>` and `/router unpin`: pin one upcoming prompt to `micro`, `low`, `medium`, or `high`.
+- `/router auto` and `/router off`: enable or disable automatic routing. `off` returns the session to its native model. Choosing a model yourself also turns routing off, on that model. A session on a model no route runs starts with routing off.
+- `/router pin <tier>` and `/router unpin`: pin one upcoming prompt to `micro`, `low`, `medium`, or `high`. Pinning needs routing on.
 - `/router model <tier>`: select any enabled model and variant in a searchable dialog.
 - `/router route <tier> <provider/model#variant>`: set a tier route directly.
 - `/router activity on|off`: enable or disable activity overrides.

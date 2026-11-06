@@ -1,10 +1,11 @@
 import { ClassifierClient } from '../lib/classifier-client.mjs';
 import { resolveCredentials } from '../lib/classifier-contract.mjs';
 import { activeClassifier, TIERS } from '../lib/config.mjs';
-import { classifierStatus, classifierWarns } from '../lib/display.mjs';
+import { classifierStatus, classifierWarns, NOT_A_TIER_REASON } from '../lib/display.mjs';
 import { observedActivity, promptIndex, routingBucket } from '../lib/facts.mjs';
 import {
   canMoveUp,
+  cellForModel,
   chooseRoute,
   continueRoute,
   emptyLoop,
@@ -14,6 +15,7 @@ import {
   observedMove,
   observeResponse,
   prepareLoop,
+  resetHistory,
 } from '../lib/route.mjs';
 import { classifiedAlias, PASS_LABEL, passReason, SPAWN_DEADLINE_MS, spawnPrompt } from '../lib/subagents.mjs';
 import {
@@ -55,6 +57,9 @@ const failOpen =
     }
   };
 
+// Nothing from an earlier routed turn stays once routing stops choosing.
+const NO_ROUTE = { tier: null, activity: null };
+
 const initialState = (session) => ({
   sessionID: session.id,
   parentID: session.parentID ?? null,
@@ -75,6 +80,8 @@ const initialState = (session) => ({
   error: null,
   pendingPin: null,
   switches: 0,
+  switching: false,
+  fixed: false,
   loop: null,
   observedAt: null,
   generation: 0,
@@ -108,6 +115,17 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     return credential?.key ?? null;
   }
 
+  // A session whose model no route runs was chosen by hand, so routing starts off, as it does for Claude. An unknown
+  // catalog leaves it on: the routes are still checked when the turn reads them.
+  async function startsOff({ nativeModel, parentID }) {
+    if (parentID || !nativeModel) return false;
+    try {
+      return cellForModel(routerConfig(config, await listModels(), nativeModel), modelId(nativeModel)) === null;
+    } catch {
+      return false;
+    }
+  }
+
   function ensure(sessionID) {
     if (sessions.has(sessionID)) return sessions.get(sessionID);
     // One read per session: a TUI snapshot can race the prompt hook, and each decision must land on the same state.
@@ -116,9 +134,11 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         sessionID,
         ctx.session
           .get({ sessionID })
-          .then((session) => {
+          .then(async (session) => {
             const state = initialState(session);
             state.classifier = { id: config.classifier, label: classifierLabel(config) };
+            if (await startsOff(state))
+              Object.assign(state, { mode: 'manual', phase: 'manual', reason: NOT_A_TIER_REASON });
             sessions.set(sessionID, state);
             return state;
           })
@@ -287,6 +307,23 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     });
   }
 
+  // `switching` covers the wait: a prompt arriving meanwhile can see the new model before `nextModel` does.
+  async function switchTo(state, model) {
+    state.switching = true;
+    try {
+      await ctx.session.switchModel({ sessionID: state.sessionID, model });
+      state.nextModel = model;
+    } finally {
+      state.switching = false;
+    }
+  }
+
+  // Turning routing off, by command or by choosing a model. The classifier's work for the turn stops with it.
+  function turnOff(state, reason) {
+    cancelReview(state.sessionID);
+    Object.assign(state, { mode: 'manual', phase: 'manual', reason, pendingPin: null, error: null, ...NO_ROUTE });
+  }
+
   // Applies a selected loop. It is taken first, so a step arriving during the switch sees it, and undone if the host
   // refuses: the state and the decision row only ever describe a switch that happened.
   async function commit(state, selected, origin, advice) {
@@ -297,7 +334,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     state.phase = state.mode === 'manual' ? 'manual' : 'routed';
     if (ref && !sameModel(state.nextModel, ref)) {
       try {
-        await ctx.session.switchModel({ sessionID: state.sessionID, model: ref });
+        await switchTo(state, ref);
       } catch (error) {
         state.loop = previous;
         state.reason = 'model-unavailable';
@@ -305,7 +342,6 @@ export async function createController(ctx, options = {}, dependencies = {}) {
         await update(state);
         return;
       }
-      state.nextModel = ref;
       state.switches += 1;
     }
     showDecision(state, decision, advice);
@@ -413,16 +449,22 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     },
     async setMode(sessionID, mode) {
       const state = await ensure(sessionID);
-      state.mode = mode;
-      state.phase = mode === 'manual' ? 'manual' : 'ready';
-      state.reason = mode === 'manual' ? 'routing off' : 'ready';
-      state.error = null;
+      if (mode === 'manual') {
+        turnOff(state, 'routing off');
+        // The session model is persisted, so off has to put the native model back.
+        if (state.nativeModel && !sameModel(state.nextModel, state.nativeModel))
+          await switchTo(state, state.nativeModel).catch((error) => {
+            state.error = error instanceof Error ? error.message : String(error);
+          });
+      } else Object.assign(state, { mode, phase: 'ready', reason: 'ready', error: null });
       await update(state);
       return sessionSnapshot(state);
     },
     async setPin(sessionID, tier) {
       if (tier !== null && !TIERS.includes(tier)) throw new Error(`unknown tier "${tier}"`);
       const state = await ensure(sessionID);
+      if (tier !== null && state.mode === 'manual')
+        throw new Error('Routing is off. Turn routing on before pinning a turn.');
       state.pendingPin = tier;
       await update(state);
       return sessionSnapshot(state);
@@ -446,17 +488,30 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     },
     prompt: failOpen(async (event) => {
       const state = await ensure(event.sessionID);
+      const session = await ctx.session.get({ sessionID: event.sessionID });
+      // A prompt into a running turn is not a turn: it keeps the route, the pin and any review. A queued prompt starts
+      // later with no hook of its own, so a review routes it.
+      if ((session.time?.busy ?? 0) > (session.time?.idle ?? 0)) return;
       cancelReview(event.sessionID);
       state.generation += 1;
       const generation = state.generation;
       state.lastPrompt = event.prompt.text;
-      const session = await ctx.session.get({ sessionID: event.sessionID });
+      // The TUI commits a model the user selected just before this hook, so a difference here is theirs. Comparing
+      // here, not on `session.model.selected`, stops a late event letting this turn overwrite their choice.
+      const selected = session.model ?? state.nextModel;
+      const changed = selected && state.nextModel && !sameModel(selected, state.nextModel);
+      const manual = changed && !state.switching && !state.parentID && session.agent === state.agent;
+      if (!state.switching) state.nextModel = selected;
       state.agent = session.agent ?? state.agent;
-      state.nextModel = session.model ?? state.nextModel;
+      if (manual && state.mode === 'auto') turnOff(state, 'model selected manually');
+      if (state.mode === 'manual' && !state.parentID) state.nativeModel = state.nextModel ?? state.nativeModel;
       state.fixed = config.fixedAgents.includes(state.agent) || Boolean((await agentDefinition(state.agent))?.model);
       // A subagent keeps the model it spawned on: a switch between its steps would rewrite its context cold.
       if (state.mode === 'manual' || state.parentID || state.fixed) {
-        if (state.mode !== 'manual') state.reason = state.parentID ? 'subagent' : `fixed agent ${state.agent}`;
+        if (state.mode !== 'manual') {
+          state.reason = state.parentID ? 'subagent' : `fixed agent ${state.agent}`;
+          Object.assign(state, NO_ROUTE);
+        }
         await update(state);
         return;
       }
@@ -523,9 +578,18 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     idle: failOpen(async (sessionID) => {
       cancelReview(sessionID);
       const state = await ensure(sessionID);
+      if (state.phase === 'choosing') Object.assign(state, { phase: 'ready', reason: 'interrupted' });
       const messages = await ctx.session.context({ sessionID });
       const assistant = messages.findLast((message) => message.type === 'assistant' && message.model);
       if (assistant) state.activeModel = assistant.model;
+      await update(state);
+    }),
+    // Compaction or a rewind replaced the history: the votes and cached prefixes were about the old one.
+    resetHistory: failOpen(async (sessionID) => {
+      const state = sessions.get(sessionID);
+      if (!state?.loop) return;
+      cancelReview(sessionID);
+      state.loop = resetHistory(state.loop);
       await update(state);
     }),
     remove(sessionID) {
