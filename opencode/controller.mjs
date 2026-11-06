@@ -8,12 +8,14 @@ import {
   chooseRoute,
   continueRoute,
   emptyLoop,
+  isModelAllowed,
   isNativeFallback,
   nativeFacts,
   observedMove,
   observeResponse,
   prepareLoop,
 } from '../lib/route.mjs';
+import { classifiedAlias, PASS_LABEL, passReason, SPAWN_DEADLINE_MS, spawnPrompt } from '../lib/subagents.mjs';
 import {
   availableModelIds,
   classifierLabel,
@@ -89,6 +91,8 @@ export async function createController(ctx, options = {}, dependencies = {}) {
   const turnConfigs = new Map();
   // Shared so one session's failures pause the classifier for all, and not exclusive so sessions do not answer each other `busy`.
   const client = new ClassifierClient({ exclusive: false });
+  // A breaker of its own, so spawn failures never pause routing of the main turn.
+  const spawnClient = new ClassifierClient({ exclusive: false });
   const controller = new AbortController();
   let publish = async () => {};
 
@@ -154,7 +158,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     return error === 'paused' ? `${status} until ${new Date(client.pausedUntil).toLocaleTimeString()}` : status;
   }
 
-  async function ask(state, cfg, facts, abort = controller.signal) {
+  async function ask(state, cfg, facts, abort = controller.signal, classifier = client) {
     const credentials = await resolveCredentials(activeClassifier(cfg), async (name) => {
       const env = name.toUpperCase();
       return ctx.options[name] || process.env[env] || (name === 'openrouter_api_key' ? openRouterKey() : null);
@@ -173,7 +177,7 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     };
     const result = dependencies.ask
       ? await dependencies.ask({ config: cfg, prompt, turns, state, signal })
-      : await client.ask({
+      : await classifier.ask({
           request,
           sleep,
           config: cfg,
@@ -192,12 +196,23 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       origin,
       classifier: state.classifier.label,
       tier: decision.tier ?? null,
-      confidence: state.tierConfidence,
+      confidence: decision.confidence === undefined ? state.tierConfidence : decision.confidence,
       activity: decision.activity ?? null,
       reason: decision.reason,
       model: formatModelRef(ref ?? state.nextModel),
     });
     state.decisions.length = Math.min(state.decisions.length, 20);
+  }
+
+  // An agent's definition as lib/subagents.mjs reads it, or null when the host has none.
+  async function agentDefinition(agentID) {
+    try {
+      const result = await ctx.agent.get({ agentID });
+      const info = result?.data ?? result;
+      return info ? { model: info.model ? formatModelRef(info.model) : null, modelRouting: null } : null;
+    } catch {
+      return null;
+    }
   }
 
   // The config stays frozen for a turn: a route edit reaches the next turn, not a step of this one.
@@ -351,6 +366,19 @@ export async function createController(ctx, options = {}, dependencies = {}) {
     if (moved !== loop) await commit(state, moved, 'observed');
   }
 
+  // A spawn's model, from its task text alone. The wait delays the subagent's start, so it is capped.
+  async function decideSpawn(parent, turn, task) {
+    const { cfg } = turn;
+    const entry = activeClassifier(cfg);
+    const timeoutMs = Math.min(entry.timeoutMs, SPAWN_DEADLINE_MS);
+    const capped = { ...cfg, classifiers: { ...cfg.classifiers, [cfg.classifier]: { ...entry, timeoutMs } } };
+    const facts = { prompt: spawnPrompt(cfg, task), turns: [] };
+    const { advice } = await ask(parent, capped, facts, controller.signal, spawnClient);
+    const alias = classifiedAlias(cfg, advice);
+    const allowed = alias && isModelAllowed(cfg.models[alias].id, turn.availableModels, turn.nativeModel);
+    return { advice, model: allowed ? alias : null };
+  }
+
   async function routeStep(state, model) {
     const turn = await read(state);
     if (isNativeFallback(state.loop, modelId(model))) {
@@ -425,8 +453,10 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       const session = await ctx.session.get({ sessionID: event.sessionID });
       state.agent = session.agent ?? state.agent;
       state.nextModel = session.model ?? state.nextModel;
-      if (state.mode === 'manual' || config.fixedAgents.includes(state.agent)) {
-        if (state.mode !== 'manual') state.reason = `fixed agent ${state.agent}`;
+      state.fixed = config.fixedAgents.includes(state.agent) || Boolean((await agentDefinition(state.agent))?.model);
+      // A subagent keeps the model it spawned on: a switch between its steps would rewrite its context cold.
+      if (state.mode === 'manual' || state.parentID || state.fixed) {
+        if (state.mode !== 'manual') state.reason = state.parentID ? 'subagent' : `fixed agent ${state.agent}`;
         await update(state);
         return;
       }
@@ -462,9 +492,33 @@ export async function createController(ctx, options = {}, dependencies = {}) {
       state.activeModel = event.model;
       if (!state.nextModel) state.nextModel = event.model;
       if (state.mode !== 'manual') state.phase = 'routed';
-      const routed = state.mode === 'auto' && !state.parentID && !config.fixedAgents.includes(event.agent);
+      const routed = state.mode === 'auto' && !state.parentID && !state.fixed;
       if (routed && state.loop?.decision) await routeStep(state, event.model);
       await update(state);
+    }),
+    // Runs before the child session exists, so the model applies from its first request, with no cache to lose. The
+    // host resolves `input.model` ahead of the agent's own model and the parent's. A rejection here fails the call.
+    spawn: failOpen(async (event) => {
+      if (event.tool !== 'subagent' || typeof event.input !== 'object' || event.input === null) return;
+      const parent = await ensure(event.sessionID);
+      const turn = await turnConfig(parent);
+      if (parent.mode !== 'auto' || turn.cfg.subagentRouting === 'off') return;
+      const { input } = event;
+      const task = { ...input, model: input.model || null, subagentType: input.agent };
+      const definition = await agentDefinition(input.agent);
+      const pass = input.sessionID ? 'resumed' : passReason(turn.cfg, task, definition);
+      const decision = pass ? null : await decideSpawn(parent, turn, task);
+      if (decision?.model) event.input = { ...input, model: decision.model };
+      const advice = decision?.advice;
+      const row = {
+        tier: advice?.choice ?? null,
+        confidence: advice?.confidence ?? null,
+        activity: advice?.activity?.choice ?? null,
+        reason: pass ? (PASS_LABEL[pass] ?? pass) : advice ? 'spawn' : 'no-advice',
+      };
+      const picked = decision?.model || input.model || definition?.model;
+      record(parent, 'spawn', row, picked ? parseModelRef(picked) : null);
+      await update(parent);
     }),
     idle: failOpen(async (sessionID) => {
       cancelReview(sessionID);

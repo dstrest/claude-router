@@ -1,4 +1,4 @@
-import { activeClassifier, EFFORTS, loadConfig, TIERS } from '../lib/config.mjs';
+import { activeClassifier, EFFORTS, loadConfig, SUBAGENT_MODES, TIERS } from '../lib/config.mjs';
 
 export function parseModelRef(value) {
   if (typeof value !== 'string') throw new Error('model must be a provider/model string');
@@ -55,6 +55,8 @@ export function normalizeOptions(options = {}) {
     throw new Error(`unknown classifier "${options.classifier}"`);
   if (options.activityRouting && !['on', 'off'].includes(options.activityRouting))
     throw new Error('activityRouting must be "on" or "off"');
+  if (options.subagentRouting && !SUBAGENT_MODES.includes(options.subagentRouting))
+    throw new Error(`subagentRouting must be one of ${SUBAGENT_MODES.join(', ')}`);
   if (
     options.ollamaTimeoutMs !== undefined &&
     (!Number.isFinite(options.ollamaTimeoutMs) || options.ollamaTimeoutMs <= 0)
@@ -84,6 +86,7 @@ export function normalizeOptions(options = {}) {
     cache: { ...config.cache, effortScope: 'shared' },
     fixedAgents: options.fixedAgents ?? [],
     activityRouting: options.activityRouting ?? config.activityRouting,
+    subagentRouting: options.subagentRouting ?? config.subagentRouting,
     routeRefs: routeMap(options.routes),
     activityRefs: Object.fromEntries(
       Object.entries(options.activities ?? {}).map(([activity, routes]) => [activity, routeMap(routes)]),
@@ -140,7 +143,14 @@ export function routerConfig(config, catalog, nativeModel) {
     ]),
   );
   route(native);
-  return { ...config, models, routes, activities };
+  const subagents = {
+    ...config.subagents,
+    types: {},
+    light: routes.micro.model,
+    standard: routes.medium.model,
+    heavy: routes.high.model,
+  };
+  return { ...config, models, routes, activities, subagents };
 }
 
 export const availableModelIds = (catalog) =>

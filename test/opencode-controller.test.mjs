@@ -43,6 +43,8 @@ async function harness(
   sessionFields = {},
   dependencies = null,
   activities = {},
+  options = {},
+  agents = { build: {}, general: {}, web: { model: tiny } },
 ) {
   const switches = [];
   const published = [];
@@ -61,10 +63,16 @@ async function harness(
       },
     },
     model: { list: async () => ({ data: models }) },
+    agent: {
+      get: async ({ agentID }) => {
+        if (!Object.hasOwn(agents, agentID)) throw new Error('unknown agent');
+        return { data: { id: agentID, ...agents[agentID] } };
+      },
+    },
   };
   const controller = await createController(
     ctx,
-    { classifier: 'ollama', routes, activities, fixedAgents },
+    { classifier: 'ollama', routes, activities, fixedAgents, ...options },
     dependencies ?? {
       ask: async (input) => {
         current.asks += 1;
@@ -812,5 +820,176 @@ test('a tool call made after a review snapshot can still move the route up', asy
   assert.equal(answered.length, 1);
   await step();
   assert.deepEqual(switches, [{ sessionID: 'ses_test', model: openai }]);
+  controller.close();
+});
+
+const tierRoutes = {
+  micro: 'openrouter/cheap/tiny',
+  medium: 'openrouter/moonshotai/kimi-k3.1-pro#high',
+  high: 'openai/gpt-6.1-sol#high',
+};
+const spawnEvent = (input) => ({
+  tool: 'subagent',
+  sessionID: 'ses_test',
+  agent: 'build',
+  input: { agent: 'general', description: 'Find the bug', prompt: 'Look around', ...input },
+});
+
+test('a spawn takes the tier model, chosen from the task text alone', async () => {
+  const { controller, calls, stored, reply } = await harness(highAdvice, tierRoutes);
+  stored.push({ type: 'user', text: 'Parent history stays out of it' });
+  reply();
+  const event = spawnEvent();
+  await controller.spawn(event);
+  assert.equal(event.input.model, 'openai/gpt-6.1-sol#high');
+  assert.equal(calls[0].prompt, 'Find the bug\nLook around');
+  assert.deepEqual(calls[0].turns, []);
+  const state = await controller.snapshot('ses_test');
+  assert.equal(state.decisions[0].origin, 'spawn');
+  assert.equal(state.decisions[0].model, 'openai/gpt-6.1-sol#high');
+  controller.close();
+});
+
+test('a spawn picks light for small work and standard for the rest', async () => {
+  const pick = async (advice) => {
+    const { controller } = await harness(advice, tierRoutes);
+    const event = spawnEvent();
+    await controller.spawn(event);
+    controller.close();
+    return event.input.model;
+  };
+  assert.equal(
+    await pick({ choice: 'micro', confidence: 0.9, probabilities: { micro: 0.9 } }),
+    'openrouter/cheap/tiny',
+  );
+  assert.equal(
+    await pick({
+      choice: 'medium',
+      confidence: 0.9,
+      probabilities: { medium: 0.9 },
+      activity: { choice: 'explore', probabilities: { explore: 0.9 } },
+    }),
+    'openrouter/cheap/tiny',
+  );
+  assert.equal(
+    await pick({ choice: 'medium', confidence: 0.9, probabilities: { medium: 0.9 } }),
+    'openrouter/moonshotai/kimi-k3.1-pro#high',
+  );
+});
+
+test('a spawn the router must not choose for passes unchanged, with its reason recorded', async () => {
+  const cases = [
+    ['explicit model', { model: 'openai/gpt-6.1-sol#high' }],
+    ['pinned model', { agent: 'web' }],
+    ['no definition', { agent: 'mystery' }],
+    ['resumed', { sessionID: 'ses_child' }],
+  ];
+  for (const [reason, input] of cases) {
+    const { controller, asks } = await harness(highAdvice, tierRoutes);
+    const event = spawnEvent(input);
+    const before = structuredClone(event.input);
+    await controller.spawn(event);
+    assert.deepEqual(event.input, before, reason);
+    assert.equal(asks(), 0, reason);
+    const row = (await controller.snapshot('ses_test')).decisions[0];
+    assert.equal(row.reason, reason);
+    if (input.model) assert.equal(row.model, input.model);
+    if (input.agent === 'web') assert.equal(row.model, 'openrouter/cheap/tiny');
+    controller.close();
+  }
+});
+
+test('an empty model on a spawn is no model', async () => {
+  const { controller } = await harness(highAdvice, tierRoutes);
+  const event = spawnEvent({ model: '', sessionID: '' });
+  await controller.spawn(event);
+  assert.equal(event.input.model, 'openai/gpt-6.1-sol#high');
+  controller.close();
+});
+
+test('other tools, routing off and subagent routing off leave a spawn alone', async () => {
+  const on = await harness(highAdvice, tierRoutes);
+  const other = { ...spawnEvent(), tool: 'shell' };
+  await on.controller.spawn(other);
+  assert.equal(other.input.model, undefined);
+  await on.controller.setMode('ses_test', 'manual');
+  const manual = spawnEvent();
+  await on.controller.spawn(manual);
+  assert.equal(manual.input.model, undefined);
+  assert.equal(on.asks(), 0);
+  on.controller.close();
+  const off = await harness(highAdvice, tierRoutes, [], {}, null, {}, { subagentRouting: 'off' });
+  const event = spawnEvent();
+  await off.controller.spawn(event);
+  assert.equal(event.input.model, undefined);
+  off.controller.close();
+  await assert.rejects(
+    () => harness(highAdvice, tierRoutes, [], {}, null, {}, { subagentRouting: 'sometimes' }),
+    /subagentRouting/,
+  );
+});
+
+test('no advice or an unavailable route keeps the host pick', async () => {
+  const silent = await harness(null, tierRoutes);
+  const event = spawnEvent();
+  await silent.controller.spawn(event);
+  assert.equal(event.input.model, undefined);
+  assert.equal((await silent.controller.snapshot('ses_test')).decisions[0].reason, 'no-advice');
+  silent.controller.close();
+  const missing = await harness(highAdvice, { ...tierRoutes, high: 'openai/not-connected#high' });
+  const blocked = spawnEvent();
+  await missing.controller.spawn(blocked);
+  assert.equal(blocked.input.model, undefined);
+  missing.controller.close();
+});
+
+test('a spawn waits at most three seconds', async () => {
+  const { controller, calls } = await harness(highAdvice, tierRoutes, [], {}, null, {}, { ollamaTimeoutMs: 60_000 });
+  await controller.spawn(spawnEvent());
+  assert.equal(calls[0].config.classifiers.ollama.timeoutMs, 3000);
+  controller.close();
+});
+
+test('spawn failures keep their own breaker, so they never pause the main turn', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('nope', { status: 400 }));
+  const { controller } = await harness(highAdvice, tierRoutes, [], {}, {});
+  for (let failure = 0; failure < 4; failure += 1) await controller.spawn(spawnEvent());
+  assert.equal(fetch.mock.callCount(), 3);
+  await send(controller);
+  assert.equal(fetch.mock.callCount(), 4);
+  assert.doesNotMatch((await controller.snapshot('ses_test')).error ?? '', /paused/);
+  controller.close();
+});
+
+test('a child session keeps its spawn model for every step', async () => {
+  const { controller, asks, switches, steps } = await harness(highAdvice, tierRoutes, [], { parentID: 'ses_parent' });
+  await send(controller);
+  await steps(9);
+  await send(controller, 'A second message to the same child');
+  assert.equal(asks(), 0);
+  assert.equal(switches.length, 0);
+  assert.equal((await controller.snapshot('ses_test')).reason, 'subagent');
+  controller.close();
+});
+
+test('a failed spawn hook never fails the tool call', async (t) => {
+  quietConsole(t);
+  const { controller, ctx } = await harness(highAdvice, tierRoutes);
+  ctx.model.list = async () => {
+    throw new Error('host down');
+  };
+  const event = spawnEvent();
+  await controller.spawn(event);
+  assert.equal(event.input.model, undefined);
+  controller.close();
+});
+
+test('a main session on an agent with its own model is left alone', async () => {
+  const { controller, asks, switches, steps } = await harness(highAdvice, tierRoutes, [], { agent: 'web' });
+  await send(controller);
+  await steps(9);
+  assert.equal(asks(), 0);
+  assert.equal(switches.length, 0);
+  assert.equal((await controller.snapshot('ses_test')).reason, 'fixed agent web');
   controller.close();
 });

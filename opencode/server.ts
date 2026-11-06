@@ -21,6 +21,7 @@ export default Plugin.define({
 
     await ctx.session.hook('prompt', (event) => controller.prompt(event));
     await ctx.session.hook('context', (event) => controller.context(event));
+    await ctx.tool.hook('execute.before', (event) => controller.spawn(event));
 
     const events = new AbortController();
     void (async () => {

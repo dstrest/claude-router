@@ -7,6 +7,7 @@ This is an additive OpenCode V2 adapter. The existing Claude Code plugin remains
 - Routes each admitted prompt through the selected classifier (Ollama, Jev, Clef, Clef Flash, Clef Omni, or OpenAI).
 - Uses full OpenCode `provider/model#variant` references. Any enabled provider and model is selectable, including OpenRouter's `openrouter/moonshotai/kimi-k3.1-pro`.
 - Shows one line above the composer, `active → next · tier/activity · reason`, fitted to the available width, and raises a `Model changed` toast when the router switches models.
+- Routes each subagent once, at spawn, from its task text: `high` for a clearly hard task, `micro` for small or exploratory work, and `medium` otherwise. An agent with its own `model`, an explicit model on the call, and a resumed child keep theirs. Set `subagentRouting: "off"` to turn this off.
 - Provides a `/router` session panel with the classifier, confidence, tier and activity probabilities, active and next models, routing reason, configured routes, activity overrides, and recent decisions.
 - Supports automatic/manual routing, one-prompt tier pins, activity routing on/off, and selection from every enabled model and variant.
 - Moves between tiers with the shared policy in `lib/policy.mjs`: an upgrade or downgrade needs repeated votes and enough probability mass, a confident two-tier jump needs one vote, and a same-task downgrade also waits out the dwell.
