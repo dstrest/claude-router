@@ -81,3 +81,42 @@ test('no notice without a new switch, for a pin, or for an effort-only change', 
   assert.equal(switchNotice(state(), state({ switches: 1, reason: 'pinned' })), null);
   assert.equal(switchNotice(state(), state({ switches: 1, activeModel: opus, nextModel: opusMedium })), null);
 });
+
+test('no notice when a model of the move is unknown, and a later switch still gets one', () => {
+  assert.equal(switchNotice(state(), state({ switches: 1, activeModel: null })), null);
+  assert.equal(switchNotice(state(), state({ switches: 1, nextModel: null })), null);
+  assert.match(switchNotice(state({ switches: 1 }), state({ switches: 2 })), /^Model changed/);
+});
+
+test('the status says what the classifier chose, even when the route stays', () => {
+  const held = state({
+    activeModel: flash,
+    nextModel: flash,
+    tier: 'low',
+    activity: 'debug',
+    reason: 'cash-gate',
+    classifier: { label: 'Jev (OpenRouter)' },
+    adviceChoice: 'high',
+    activityChoice: 'review',
+    tierConfidence: 0.92,
+  });
+  assert.equal(fit(held, 90), 'deepseek-v4.1-flash-1017 · low/debug · Jev high/review 92% · = cache cap');
+});
+
+test('the classifier reading goes first when the line is short', () => {
+  const held = state({ adviceChoice: 'high', tierConfidence: 0.9, classifier: { label: 'Ollama' } });
+  const full = fit(held, 200);
+  assert.match(full, /Ollama high 90%/);
+  assert.doesNotMatch(fit(held, full.length - 1), /Ollama/);
+  assert.match(fit(held, full.length - 1), /↑ needs stronger$/);
+});
+
+test('an uncertain activity is not printed as a choice', () => {
+  const held = state({
+    adviceChoice: 'low',
+    activityChoice: 'uncertain',
+    tierConfidence: 0.5,
+    classifier: { label: 'Jev' },
+  });
+  assert.match(fit(held, 200), /· Jev low 50% ·/);
+});

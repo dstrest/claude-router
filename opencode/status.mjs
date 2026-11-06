@@ -5,6 +5,14 @@ import { sameModel, variantOf } from './config.mjs';
 const shortName = (ref) => [ref.id.split('/').at(-1), variantOf(ref)].filter(Boolean).join('#');
 const joined = (...parts) => parts.filter(Boolean).join(' · ');
 
+// What the classifier said, which can differ from the route when a gate holds the move.
+function classifierReading({ classifier, adviceChoice, activityChoice, tierConfidence }) {
+  if (!classifier?.label || !adviceChoice) return '';
+  const activity = activityChoice && activityChoice !== 'uncertain' ? `/${activityChoice}` : '';
+  const confidence = Number.isFinite(tierConfidence) ? ` ${Math.round(tierConfidence * 100)}%` : '';
+  return `${classifier.label.split(' ')[0]} ${adviceChoice}${activity}${confidence}`;
+}
+
 export function fit(state, width) {
   const { activeModel: active, nextModel: next, tier, activity } = state;
   const target = next ?? active;
@@ -14,6 +22,7 @@ export function fit(state, width) {
   const reason = state.phase === 'choosing' ? 'choosing…' : shortReason(state.reason, activity);
   const models = moves ? `${shortName(active)} → ${shortName(target)}` : shortName(target);
   const candidates = [
+    joined(models, route, classifierReading(state), reason),
     joined(models, route, reason),
     joined(models, route),
     joined(`${moves ? '→ ' : ''}${shortName(target)}`, route),
@@ -26,6 +35,6 @@ export function fit(state, width) {
 export function switchNotice(previous, state) {
   if (!previous || state.switches <= previous.switches || state.reason === 'pinned') return null;
   const { activeModel: from, nextModel: to } = state;
-  if (from?.providerID === to?.providerID && from?.id === to?.id) return null;
+  if (!from || !to || (from.providerID === to.providerID && from.id === to.id)) return null;
   return `Model changed: ${shortName(from)} → ${shortName(to)} · ${shortReason(state.reason, state.activity)}`;
 }

@@ -299,6 +299,7 @@ test('the usage report reads as routing against no routing', () => {
     period: 'session',
     spendUsd: 1.25,
     replies: 4,
+    comparedReplies: 4,
     early: true,
     routedUsd: 1.25,
     yoursUsd: 2,
@@ -313,10 +314,10 @@ test('the usage report reads as routing against no routing', () => {
     latency: { ms: 2000, over: false, turns: 4 },
   });
   assert.equal(lines[0], 'Usage (session): $1.25 over 4 replies · early sample');
-  assert.equal(lines[1], 'Routing vs no routing: $1.25 vs $2.00 · -$0.75 (-38%)');
+  assert.equal(lines[1], 'Routing vs no routing (estimate): $1.25 vs $2.00 · -$0.75 (-38%)');
   assert.equal(lines[2], 'Cheaper models -$0.80 · stronger $0.00 · switches +$0.05');
   assert.ok(lines.includes('What if: openrouter/cheap/tiny $0.50'));
-  assert.ok(lines.some((line) => /Classifier agreed on 3 of 4 turns · p95 2.0s/.test(line)));
+  assert.ok(lines.some((line) => /This session, the classifier agreed on 3 of 4 turns · p95 2.0s/.test(line)));
   assert.ok(lines.some((line) => /Switch cache writes took 20%/.test(line)));
 });
 
@@ -352,4 +353,24 @@ test('the default variant is available wherever the model is', () => {
   assert.deepEqual(Object.keys(cfg.models), [formatModelRef(ref)]);
   assert.equal(cfg.models[formatModelRef(ref)].id, 'openrouter/deepseek/deepseek-v4.1-flash-1017');
   assert.equal(cfg.models[formatModelRef(ref)].contextWindow, 1_000_000);
+});
+
+test('a comparison over fewer replies than the spend says so, and a slow p95 is a bound', () => {
+  const lines = usageLines({
+    period: 'today',
+    spendUsd: 1,
+    replies: 7,
+    comparedReplies: 6,
+    routedUsd: 0.9,
+    yoursUsd: 1,
+    differenceUsd: -0.1,
+    cheaperUsd: -0.1,
+    strongerUsd: 0,
+    switchUsd: 0,
+    share: -0.1,
+    agreement: { matched: 1, total: 1 },
+    latency: { ms: 8000, over: true, turns: 1 },
+  });
+  assert.equal(lines[1], 'Routing vs no routing (estimate, 6 of 7 replies): $0.90 vs $1.00 · -$0.10 (-10%)');
+  assert.ok(lines.some((line) => /p95 over 8\.0s/.test(line)));
 });

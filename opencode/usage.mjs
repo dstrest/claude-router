@@ -2,7 +2,8 @@ import { readout } from '../lib/savings.mjs';
 import { insights, periodRange, summarize } from '../lib/usage.mjs';
 
 // compareModels prices at list rates; the host reports what a reply really cost. Scaling every part keeps them adding
-// up, and a reply on your own model at exactly no difference.
+// up, and a reply on your own model at exactly no difference. The result is an estimate: the served model's ratio
+// stands in for the other model's, whose real price was never billed.
 export function atHostCost(reply, cost) {
   if (!Number.isFinite(cost) || !(reply?.routedUsd > 0)) return reply;
   const scale = cost / reply.routedUsd;
@@ -23,6 +24,7 @@ export function usageReport(record, period, now) {
     ...readout(summary),
     spendUsd: summary.observed.routedUsd,
     replies: summary.observed.replies,
+    comparedReplies: summary.replies,
     whatIf,
     insights: insights(summary),
   };
@@ -39,10 +41,13 @@ const INSIGHT_TEXT = {
 
 export function usageLines(report) {
   if (!report.replies) return [`Usage (${report.period}): no replies yet`];
-  const { spendUsd, replies, early, routedUsd, yoursUsd, differenceUsd, share } = report;
+  const { spendUsd, replies, comparedReplies, early, routedUsd, yoursUsd, differenceUsd, share } = report;
   const lines = [`Usage (${report.period}): ${usd(spendUsd)} over ${replies} replies${early ? ' · early sample' : ''}`];
   const change = share === null ? '' : ` (${share < 0 ? '-' : '+'}${percent(Math.abs(share))})`;
-  lines.push(`Routing vs no routing: ${usd(routedUsd)} vs ${usd(yoursUsd)} · ${signed(differenceUsd)}${change}`);
+  const scope = comparedReplies === replies ? 'estimate' : `estimate, ${comparedReplies} of ${replies} replies`;
+  lines.push(
+    `Routing vs no routing (${scope}): ${usd(routedUsd)} vs ${usd(yoursUsd)} · ${signed(differenceUsd)}${change}`,
+  );
   lines.push(
     `Cheaper models ${signed(report.cheaperUsd)} · stronger ${signed(report.strongerUsd)} · switches ${signed(report.switchUsd)}`,
   );
@@ -50,8 +55,9 @@ export function usageLines(report) {
     lines.push(`What if: ${report.whatIf.map((row) => `${row.model} ${usd(row.usd)}`).join(' · ')}`);
   if (report.agreement?.total) {
     const { matched, total } = report.agreement;
-    const wait = report.latency ? ` · p95 ${(report.latency.ms / 1000).toFixed(1)}s` : '';
-    lines.push(`Classifier agreed on ${matched} of ${total} turns${wait}`);
+    const { latency } = report;
+    const wait = latency ? ` · p95 ${latency.over ? 'over ' : ''}${(latency.ms / 1000).toFixed(1)}s` : '';
+    lines.push(`This session, the classifier agreed on ${matched} of ${total} turns${wait}`);
   }
   for (const insight of report.insights ?? []) lines.push(INSIGHT_TEXT[insight.kind]?.(insight));
   return lines;
