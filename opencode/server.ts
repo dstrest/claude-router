@@ -2,6 +2,14 @@ import { Plugin } from '@opencode/plugin';
 import { createController } from './controller.mjs';
 import { RouterRpc } from './rpc.ts';
 
+// The durable events that end a turn. `session.idle` is deprecated, and the host no longer publishes it.
+const TURN_ENDED = [
+  'session.execution.succeeded',
+  'session.execution.failed',
+  'session.execution.interrupted',
+] as const;
+const HISTORY_REPLACED = ['session.compaction.ended', 'session.revert.committed'] as const;
+
 export default Plugin.define({
   id: 'router',
   async setup(ctx) {
@@ -36,12 +44,13 @@ export default Plugin.define({
     const events = new AbortController();
     void (async () => {
       for await (const event of ctx.event.subscribe({
-        types: ['session.idle', 'session.deleted', 'session.compaction.ended', 'session.revert.committed'],
+        types: [...TURN_ENDED, ...HISTORY_REPLACED, 'session.deleted'],
         signal: events.signal,
       })) {
-        if (event.type === 'session.idle') await controller.idle(event.data.sessionID);
-        else if (event.type === 'session.deleted') controller.remove(event.data.sessionID);
-        else await controller.resetHistory(event.data.sessionID);
+        if (event.type === 'session.deleted') await controller.remove(event.data.sessionID);
+        else if ((HISTORY_REPLACED as readonly string[]).includes(event.type))
+          await controller.resetHistory(event.data.sessionID);
+        else await controller.idle(event.data.sessionID);
       }
     })().catch((error) => {
       if (!events.signal.aborted) console.error('OpenCode router event stream failed', error);
